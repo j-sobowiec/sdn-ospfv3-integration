@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
+"""
+Minimalna topologia Containernet/Mininet z FRR i OSPFv3.
+
+Wersja poprawiona v3: uruchamia demony bez zawodnego testu PID.
+
+Uruchomienie:
+    sudo python3 topology.py
+
+Opcjonalny nowszy obraz FRR:
+    sudo FRR_IMAGE=quay.io/frrouting/frr:latest python3 topology.py
+"""
 
 import os
 import shlex
+import time
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
@@ -35,8 +47,8 @@ pathd=no
 mgmtd=no
 
 vtysh_enable=yes
-zebra_options=" -s 90000000 --daemon -A 127.0.0.1"
-ospf6d_options=" --daemon -A ::1"
+zebra_options="-A 127.0.0.1 -s 90000000"
+ospf6d_options="-A ::1"
 """
 
 
@@ -104,8 +116,50 @@ def configure_router(router, addresses, router_id, active_interfaces,
 
     write_file(router, "/etc/frr/daemons", DAEMONS)
     write_file(router, "/etc/frr/frr.conf", config)
+    write_file(router, "/etc/frr/vtysh.conf", "service integrated-vtysh-config\n")
     router.cmd("chown -R frr:frr /etc/frr /run/frr")
-    router.cmd("chmod 640 /etc/frr/daemons /etc/frr/frr.conf")
+    router.cmd(
+        "if getent group frrvty >/dev/null 2>&1; then "
+        "chown frr:frrvty /etc/frr/vtysh.conf; fi"
+    )
+    router.cmd(
+        "chmod 640 /etc/frr/daemons /etc/frr/frr.conf "
+        "/etc/frr/vtysh.conf"
+    )
+
+
+def start_frr(router):
+    """Uruchom FRR i wczytaj /etc/frr/frr.conf."""
+    output = router.cmd(
+        "if [ -x /usr/lib/frr/frrinit.sh ]; then "
+        "/usr/lib/frr/frrinit.sh start; "
+        "elif [ -x /etc/init.d/frr ]; then "
+        "/etc/init.d/frr start; "
+        "else "
+        "echo 'Nie znaleziono skryptu startowego FRR'; "
+        "fi"
+    )
+    if output.strip():
+        info(f"*** {router.name}: {output.strip()}\n")
+
+    # Daj demonom czas na utworzenie gniazd /run/frr/*.vty.
+    time.sleep(2)
+
+    # Nie przerywamy programu przez pidof/kill -0, ponieważ w części
+    # obrazów kontenerowych dają one fałszywy wynik mimo działających demonów.
+    sockets = router.cmd("ls /run/frr/*.vty 2>/dev/null")
+    if "zebra.vty" not in sockets or "ospf6d.vty" not in sockets:
+        info(
+            f"*** OSTRZEŻENIE: brak gniazd VTY na {router.name}:\n"
+            f"{sockets}\n"
+        )
+
+    # Wczytaj zintegrowaną konfigurację do działających demonów.
+    load_output = router.cmd("vtysh -b 2>&1")
+    if load_output.strip():
+        info(f"*** {router.name}, vtysh -b: {load_output.strip()}\n")
+
+    info(f"*** {router.name}: zakończono start FRR\n")
 
 
 def main():
@@ -178,6 +232,8 @@ def main():
     try:
         info("*** Start sieci i demonów zebra/ospf6d\n")
         net.start()
+        for router in (r1, r2, r3):
+            start_frr(router)
 
         info("\n*** Przykładowe polecenia w CLI:\n")
         info("r1 vtysh -c 'show ipv6 ospf6 neighbor'\n")
