@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-Minimalna topologia Containernet/Mininet z FRR i OSPFv3.
-
-Wersja poprawiona v3: uruchamia demony bez zawodnego testu PID.
-
-Uruchomienie:
-    sudo python3 topology.py
-
-Opcjonalny nowszy obraz FRR:
-    sudo FRR_IMAGE=quay.io/frrouting/frr:latest python3 topology.py
-"""
 
 import os
 import shlex
@@ -18,35 +7,16 @@ import time
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
 from mininet.net import Containernet
-from mininet.node import OVSSwitch
+from mininet.node import OVSSwitch, RemoteController
 
 
 FRR_IMAGE = os.environ.get("FRR_IMAGE", "frrouting/frr:latest")
 
 DAEMONS = """\
 zebra=yes
-bgpd=no
-ospfd=no
 ospf6d=yes
-ripd=no
-ripngd=no
-isisd=no
-pimd=no
-pim6d=no
-ldpd=no
-nhrpd=no
-eigrpd=no
-babeld=no
-sharpd=no
-staticd=no
-pbrd=no
-bfdd=no
-fabricd=no
-vrrpd=no
-pathd=no
-mgmtd=no
-
 vtysh_enable=yes
+
 zebra_options="-A 127.0.0.1 -s 90000000"
 ospf6d_options="-A ::1"
 """
@@ -165,73 +135,102 @@ def start_frr(router):
 def main():
     net = Containernet(controller=None, switch=OVSSwitch)
 
-    info("*** Dodawanie routerów FRR\n")
-    docker_params = dict(
-        ip=None,
-        dimage=FRR_IMAGE,
-        dcmd="/bin/bash",
-        cap_add=["net_admin", "net_raw", "sys_admin"],
-        rm=True,
-    )
-    r1 = net.addDocker("r1", **docker_params)
-    r2 = net.addDocker("r2", **docker_params)
-    r3 = net.addDocker("r3", **docker_params)
-
-    info("*** Dodawanie OVS i hosta\n")
-    s1 = net.addSwitch("s1", cls=OVSSwitch, failMode="standalone")
-    h1 = net.addHost("h1", ip=None)
-
-    info("*** Tworzenie pełnego trójkąta routerów\n")
-    net.addLink(r1, r2, intfName1="r1-eth0", intfName2="r2-eth0")
-    net.addLink(r2, r3, intfName1="r2-eth1", intfName2="r3-eth0")
-    net.addLink(r3, r1, intfName1="r3-eth1", intfName2="r1-eth1")
-
-    info("*** Podłączanie R1 do s1 i h1\n")
-    net.addLink(r1, s1, intfName1="r1-eth2", intfName2="s1-eth1")
-    net.addLink(s1, h1, intfName1="s1-eth2", intfName2="h1-eth0")
-
-    info("*** Konfiguracja IPv6 i OSPFv3\n")
-    configure_router(
-        r1,
-        {
-            "r1-eth0": "2001:db8:12::1/64",
-            "r1-eth1": "2001:db8:31::1/64",
-            "r1-eth2": "2001:db8:1::1/64",
-        },
-        router_id="1.1.1.1",
-        active_interfaces=("r1-eth0", "r1-eth1"),
-        passive_interfaces=("r1-eth2",),
-    )
-    configure_router(
-        r2,
-        {
-            "r2-eth0": "2001:db8:12::2/64",
-            "r2-eth1": "2001:db8:23::2/64",
-        },
-        router_id="2.2.2.2",
-        active_interfaces=("r2-eth0", "r2-eth1"),
-    )
-    configure_router(
-        r3,
-        {
-            "r3-eth0": "2001:db8:23::3/64",
-            "r3-eth1": "2001:db8:31::3/64",
-        },
-        router_id="3.3.3.3",
-        active_interfaces=("r3-eth0", "r3-eth1"),
-    )
-
-    h1.cmd("sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null")
-    h1.cmd("ip link set dev h1-eth0 up")
-    h1.cmd("ip -4 addr flush dev h1-eth0")
-    h1.cmd("ip -6 addr replace 2001:db8:1::100/64 dev h1-eth0")
-    h1.cmd(
-        "ip -6 route replace default via 2001:db8:1::1 dev h1-eth0"
-    )
-
     try:
+        c0 = net.addController(
+        "c0",
+        controller=RemoteController,
+        ip="127.0.0.1",
+        port=6653
+        )
+
+        info("*** Dodawanie routerów FRR\n")
+        docker_params = dict(
+            ip=None,
+            dimage=FRR_IMAGE,
+            dcmd="/bin/bash",
+            cap_add=["net_admin", "net_raw", "sys_admin"],
+            sysctls={"net.ipv6.conf.all.disable_ipv6": "0",
+            "net.ipv6.conf.default.disable_ipv6": "0",
+            "net.ipv6.conf.all.forwarding": "1",
+            "net.ipv6.conf.default.forwarding": "1",
+            },
+            
+            rm=True,
+        )
+        r1 = net.addDocker("r1", **docker_params)
+        r2 = net.addDocker("r2", **docker_params)
+        r3 = net.addDocker("r3", **docker_params)
+
+        info("*** Dodawanie OVS i hosta\n")
+
+        s1 = net.addSwitch(
+        "s1",
+        cls=OVSSwitch,
+        protocols="OpenFlow13",
+        failMode="secure",
+        dpid="0000000000000001"
+        )
+
+        h1 = net.addHost("h1", ip=None)
+
+        info("*** Tworzenie pełnego trójkąta routerów\n")
+        net.addLink(r1, r2, intfName1="r1-eth0", intfName2="r2-eth0")
+        net.addLink(r2, r3, intfName1="r2-eth1", intfName2="r3-eth0")
+        net.addLink(r3, r1, intfName1="r3-eth1", intfName2="r1-eth1")
+
+        info("*** Podłączanie R1 do s1 i h1\n")
+        net.addLink(r1, s1, intfName1="r1-eth2")
+        net.addLink(s1, h1)
+
+        info("*** Konfiguracja IPv6 i OSPFv3\n")
+        configure_router(
+            r1,
+            {
+                "r1-eth0": "2001:db8:12::1/64",
+                "r1-eth1": "2001:db8:31::1/64",
+                "r1-eth2": "2001:db8:1::1/64",
+            },
+            router_id="1.1.1.1",
+            active_interfaces=("r1-eth0", "r1-eth1"),
+            passive_interfaces=("r1-eth2",),
+        )
+        configure_router(
+            r2,
+            {
+                "r2-eth0": "2001:db8:12::2/64",
+                "r2-eth1": "2001:db8:23::2/64",
+            },
+            router_id="2.2.2.2",
+            active_interfaces=("r2-eth0", "r2-eth1"),
+        )
+        configure_router(
+            r3,
+            {
+                "r3-eth0": "2001:db8:23::3/64",
+                "r3-eth1": "2001:db8:31::3/64",
+            },
+            router_id="3.3.3.3",
+            active_interfaces=("r3-eth0", "r3-eth1"),
+        )
+
+        h1.cmd("sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null")
+        h1.cmd("ip link set dev h1-eth0 up")
+        h1.cmd("ip -4 addr flush dev h1-eth0")
+        h1.cmd("ip -6 addr replace 2001:db8:1::100/64 dev h1-eth0")
+        h1.cmd(
+            "ip -6 route replace default via 2001:db8:1::1 dev h1-eth0"
+        )
+
+    
         info("*** Start sieci i demonów zebra/ospf6d\n")
         net.start()
+
+        info("*** Kontroler s1:\n")
+        info(s1.cmd("ovs-vsctl get-controller s1"))
+
+        info("*** OpenFlow flows:\n")
+        info(s1.cmd("ovs-ofctl -O OpenFlow13 dump-flows s1"))
+
         for router in (r1, r2, r3):
             start_frr(router)
 
