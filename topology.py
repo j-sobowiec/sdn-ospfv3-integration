@@ -136,7 +136,7 @@ def main():
     net = Containernet(controller=None, switch=OVSSwitch)
 
     try:
-        c0 = net.addController(
+        net.addController(
         "c0",
         controller=RemoteController,
         ip="127.0.0.1",
@@ -191,8 +191,8 @@ def main():
                 "r1-eth2": "2001:db8:1::1/64",
             },
             router_id="1.1.1.1",
-            active_interfaces=("r1-eth0", "r1-eth1"),
-            passive_interfaces=("r1-eth2",),
+            active_interfaces=("r1-eth0", "r1-eth1", "r1-eth2"),
+            passive_interfaces=(),
         )
         configure_router(
             r2,
