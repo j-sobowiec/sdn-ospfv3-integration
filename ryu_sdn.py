@@ -5,6 +5,8 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ipv6
+import struct
+import socket
 
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -54,11 +56,30 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         ipv6_pkt = pkt.get_protocol(ipv6.ipv6)
 
-        if ipv6_pkt:
+        if ipv6_pkt and ipv6_pkt.nxt == 89:
             self.logger.info(
-                "IPv6: port=%s src=%s dst=%s next_header=%s",
+                "OSPFv3: port=%s src=%s dst=%s",
                 in_port,
                 ipv6_pkt.src,
                 ipv6_pkt.dst,
-                ipv6_pkt.nxt
             )
+            # Ethernet = 14 bajtów
+            # IPv6 = 40 bajtów
+            ospf_offset = 14 + 40
+
+            ospf_data = msg.data[ospf_offset:]
+
+            if len(ospf_data) >= 16:
+                version, pkt_type, pkt_len, router_id, area_id, checksum, instance_id, reserved = \
+                    struct.unpack("!BBHIIHBB", ospf_data[:16])
+
+                self.logger.info(
+                    "OSPFv3 header: version=%s type=%s length=%s "
+                    "router_id=%s area_id=%s instance_id=%s",
+                    version,
+                    pkt_type,
+                    pkt_len,
+                    socket.inet_ntoa(struct.pack("!I", router_id)),
+                    socket.inet_ntoa(struct.pack("!I", area_id)),
+                    instance_id
+                )
