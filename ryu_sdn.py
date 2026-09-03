@@ -39,6 +39,7 @@ def build_ospfv3_hello():
         socket.inet_aton(OSPF_AREA_ID)
     )[0]
 
+    # Najpierw budujemy pakiet z checksum = 0
     checksum = 0
     reserved = 0
 
@@ -67,7 +68,24 @@ def build_ospfv3_hello():
         0   # BDR
     )
 
-    return ospf_header + hello_body
+    ospf_packet = ospf_header + hello_body
+
+    # Liczymy checksum z uwzględnieniem IPv6 pseudo-header
+    checksum = calculate_ospfv3_checksum(
+        SDN_LINK_LOCAL,
+        "ff02::5",
+        ospf_packet
+    )
+
+    # Wstawiamy checksum do bajtów 12-13 nagłówka OSPFv3
+    ospf_packet = bytearray(ospf_packet)
+
+    ospf_packet[12:14] = struct.pack(
+        "!H",
+        checksum
+    )
+
+    return bytes(ospf_packet)
 
 def calculate_ospfv3_checksum(src_ipv6, dst_ipv6, ospf_packet):
     pseudo_header = (
@@ -89,6 +107,47 @@ def calculate_ospfv3_checksum(src_ipv6, dst_ipv6, ospf_packet):
         checksum = (checksum & 0xffff) + (checksum >> 16)
 
     return (~checksum) & 0xffff
+
+def mac_to_bytes(mac):
+    return bytes(
+        int(part, 16)
+        for part in mac.split(":")
+    )
+
+def build_ospfv3_hello_frame():
+    ospf_packet = build_ospfv3_hello()
+
+    # Ethernet
+    eth_dst = mac_to_bytes("33:33:00:00:00:05")
+    eth_src = mac_to_bytes(SDN_MAC)
+
+    ethernet_header = struct.pack(
+        "!6s6sH",
+        eth_dst,
+        eth_src,
+        0x86DD       # EtherType IPv6
+    )
+
+    # IPv6
+    version_tc_flow = 6 << 28
+
+    ipv6_header = struct.pack(
+        "!IHBB16s16s",
+        version_tc_flow,
+        len(ospf_packet),   # payload length = 36
+        89,                 # Next Header = OSPF
+        1,                  # Hop Limit
+        socket.inet_pton(
+            socket.AF_INET6,
+            SDN_LINK_LOCAL
+        ),
+        socket.inet_pton(
+            socket.AF_INET6,
+            "ff02::5"
+        )
+    )
+
+    return ethernet_header + ipv6_header + ospf_packet
 
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -129,12 +188,42 @@ class OSPFv3Controller(app_manager.RyuApp):
             datapath.id
         )
 
+        self.test_hello_sent = False
+
+        '''
         hello = build_ospfv3_hello()
 
+        hello_checksum = struct.unpack(
+            "!H",
+            hello[12:14]
+        )[0]
+
         self.logger.info(
-            "Zbudowano OSPFv3 Hello: %s bajtow",
-            len(hello)
+            "Zbudowano OSPFv3 Hello: %s bajtow, checksum=0x%04x",
+            len(hello),
+            hello_checksum
         )
+
+        frame = build_ospfv3_hello_frame()
+        self.logger.info(
+            "Zbudowano pelna ramke OSPFv3: %s bajtow",
+            len(frame)
+        )
+
+        test_pkt = packet.Packet(frame)
+
+        test_eth = test_pkt.get_protocol(ethernet.ethernet)
+        test_ipv6 = test_pkt.get_protocol(ipv6.ipv6)
+
+        self.logger.info(
+            "Wlasna ramka: Ethernet %s -> %s, IPv6 %s -> %s, next_header=%s",
+            test_eth.src,
+            test_eth.dst,
+            test_ipv6.src,
+            test_ipv6.dst,
+            test_ipv6.nxt
+        )
+        '''
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -224,8 +313,14 @@ class OSPFv3Controller(app_manager.RyuApp):
                 options = int.from_bytes(options_raw, byteorder="big")
 
                 self.logger.info(
-                    "Hello: \n  interface_id=%s \n  priority=%s \n  options=0x%06x "
-                    "\n  hello_interval=%s \n  dead_interval=%s \n  DR=%s \n  BDR=%s",
+                    "Hello:\n"
+                    "  interface_id=%s\n" \
+                    "  priority=%s\n"
+                    "  options=0x%06x\n"
+                    "  hello_interval=%s\n"
+                    "  dead_interval=%s\n"
+                    "  DR=%s\n"
+                    "  BDR=%s",
                     interface_id,
                     router_priority,
                     options,
@@ -235,6 +330,34 @@ class OSPFv3Controller(app_manager.RyuApp):
                     socket.inet_ntoa(struct.pack("!I", backup_designated_router))
                 )
 
+                if checksum == calculated_checksum and not self.test_hello_sent:
+                    datapath = msg.datapath
+                    ofproto = datapath.ofproto
+                    parser = datapath.ofproto_parser
+
+                    frame = build_ospfv3_hello_frame()
+
+                    actions = [
+                        parser.OFPActionOutput(in_port)
+                    ]
+
+                    packet_out = parser.OFPPacketOut(
+                        datapath=datapath,
+                        buffer_id=ofproto.OFP_NO_BUFFER,
+                        in_port=ofproto.OFPP_CONTROLLER,
+                        actions=actions,
+                        data=frame
+                    )
+
+                    datapath.send_msg(packet_out)
+
+                    self.test_hello_sent = True
+
+                    self.logger.info(
+                        "Wyslano testowe OSPFv3 Hello do R1 przez port=%s",
+                        in_port
+                    )
+                    
                 neighbors = []
 
                 neighbor_data = ospf_data[36:pkt_len]
