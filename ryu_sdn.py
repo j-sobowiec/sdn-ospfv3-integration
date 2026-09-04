@@ -9,6 +9,7 @@ import struct
 import socket
 from ryu.lib.packet import ethernet
 from ryu.lib import hub
+import time
 
 OSPF_ROUTER_ID = "10.10.10.10"
 OSPF_AREA_ID = "0.0.0.0"
@@ -24,6 +25,8 @@ OSPF_OPTIONS = 0x000013
 
 SDN_MAC = "02:00:00:00:00:01"
 SDN_LINK_LOCAL = "fe80::10"
+
+OSPF_INTERFACE_MTU = 1500
 
 def build_ospfv3_hello(neighbors=()):
     version = 3
@@ -92,6 +95,58 @@ def build_ospfv3_hello(neighbors=()):
 
     return bytes(ospf_packet)
 
+def build_ospfv3_dbd(dd_sequence, flags=0x07):
+    version = 3
+    pkt_type = 2
+    pkt_len = 28
+
+    router_id = struct.unpack(
+        "!I",
+        socket.inet_aton(OSPF_ROUTER_ID)
+    )[0]
+
+    area_id = struct.unpack(
+        "!I",
+        socket.inet_aton(OSPF_AREA_ID)
+    )[0]
+
+    ospf_header = struct.pack(
+        "!BBHIIHBB",
+        version,
+        pkt_type,
+        pkt_len,
+        router_id,
+        area_id,
+        0,                  # checksum najpierw 0
+        OSPF_INSTANCE_ID,
+        0
+    )
+
+    options = OSPF_OPTIONS.to_bytes(3, byteorder="big")
+
+    dbd_body = struct.pack(
+        "!B3sHBBI",
+        0,                  # reserved
+        options,
+        OSPF_INTERFACE_MTU,
+        0,                  # reserved
+        flags,
+        dd_sequence
+    )
+
+    ospf_packet = ospf_header + dbd_body
+
+    checksum = calculate_ospfv3_checksum(
+        SDN_LINK_LOCAL,
+        "ff02::5",
+        ospf_packet
+    )
+
+    ospf_packet = bytearray(ospf_packet)
+    ospf_packet[12:14] = struct.pack("!H", checksum)
+
+    return bytes(ospf_packet)
+
 def calculate_ospfv3_checksum(src_ipv6, dst_ipv6, ospf_packet):
     pseudo_header = (
         socket.inet_pton(socket.AF_INET6, src_ipv6) +
@@ -154,6 +209,37 @@ def build_ospfv3_hello_frame(neighbors=()):
 
     return ethernet_header + ipv6_header + ospf_packet
 
+def build_ospfv3_dbd_frame(dd_sequence, flags=0x07):
+    ospf_packet = build_ospfv3_dbd(
+        dd_sequence,
+        flags
+    )
+
+    ethernet_header = struct.pack(
+        "!6s6sH",
+        mac_to_bytes("33:33:00:00:00:05"),
+        mac_to_bytes(SDN_MAC),
+        0x86DD
+    )
+
+    ipv6_header = struct.pack(
+        "!IHBB16s16s",
+        6 << 28,
+        len(ospf_packet),
+        89,
+        1,
+        socket.inet_pton(
+            socket.AF_INET6,
+            SDN_LINK_LOCAL
+        ),
+        socket.inet_pton(
+            socket.AF_INET6,
+            "ff02::5"
+        )
+    )
+
+    return ethernet_header + ipv6_header + ospf_packet
+
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -163,6 +249,13 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.datapath = None
         self.ospf_port = None
         self.ospf_neighbors = []
+
+        self.dbd_sequence = int(
+            time.time() * 1000
+        ) & 0xffffffff
+
+        self.dbd_negotiated = False
+        self.lsa_request_list = []
 
         self.hello_thread = hub.spawn(self.hello_loop)
 
@@ -204,7 +297,42 @@ class OSPFv3Controller(app_manager.RyuApp):
                 self.send_ospfv3_hello()
 
             hub.sleep(OSPF_HELLO_INTERVAL)
-        
+
+    def send_initial_dbd(self):
+        if self.datapath is None or self.ospf_port is None:
+            return
+
+        datapath = self.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        frame = build_ospfv3_dbd_frame(
+            self.dbd_sequence,
+            flags=0x07
+        )
+
+        actions = [
+            parser.OFPActionOutput(
+                self.ospf_port
+            )
+        ]
+
+        packet_out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=ofproto.OFPP_CONTROLLER,
+            actions=actions,
+            data=frame
+        )
+
+        datapath.send_msg(packet_out)
+
+        self.logger.info(
+            "Wyslano initial DBD: "
+            "I=1 M=1 MS=1 seq=0x%08x",
+            self.dbd_sequence
+        )
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
@@ -336,13 +464,124 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                             self.send_ospfv3_hello()
 
-                    # -----------------------------
-                    # LOGOWANIE
-                    # -----------------------------
+                        self.logger.info(
+                            "\n"
+                            "---------------- OSPFv3 HELLO ----------------\n"
+                            "port=%s\n"
+                            "src=%s\n"
+                            "dst=%s\n"
+                            "Ethernet:\n"
+                            "  src=%s\n"
+                            "  dst=%s\n"
+                            "Checksum:\n"
+                            "  received=0x%04x\n"
+                            "  calculated=0x%04x\n"
+                            "  valid=%s\n"
+                            "Header:\n"
+                            "  version=%s\n"
+                            "  type=%s\n"
+                            "  length=%s\n"
+                            "  router_id=%s\n"
+                            "  area_id=%s\n"
+                            "  instance_id=%s\n"
+                            "Hello:\n"
+                            "  interface_id=%s\n"
+                            "  priority=%s\n"
+                            "  options=0x%06x\n"
+                            "  hello_interval=%s\n"
+                            "  dead_interval=%s\n"
+                            "  neighbors=%s\n"
+                            "---------------------------------------------",
+                            in_port,
+                            ipv6_pkt.src,
+                            ipv6_pkt.dst,
+                            eth_pkt.src,
+                            eth_pkt.dst,
+                            checksum,
+                            calculated_checksum,
+                            checksum == calculated_checksum,
+                            version,
+                            pkt_type,
+                            pkt_len,
+                            socket.inet_ntoa(
+                                struct.pack("!I", router_id)
+                            ),
+                            socket.inet_ntoa(
+                                struct.pack("!I", area_id)
+                            ),
+                            instance_id,
+                            interface_id,
+                            router_priority,
+                            options,
+                            hello_interval,
+                            dead_interval,
+                            neighbors if neighbors else "brak"
+                        )
+
+                elif version == 3 and pkt_type == 2 and pkt_len >= 28:
+                    dbd_data = ospf_data[16:28]
+
+                    (
+                        reserved1,
+                        options_raw,
+                        interface_mtu,
+                        reserved2,
+                        flags,
+                        dd_sequence
+                    ) = struct.unpack(
+                        "!B3sHBBI",
+                        dbd_data
+                    )
+
+                    options = int.from_bytes(
+                        options_raw,
+                        byteorder="big"
+                    )
+
+                    i_bit = bool(flags & 0x04)
+                    m_bit = bool(flags & 0x02)
+                    ms_bit = bool(flags & 0x01)
+
+                    lsa_headers = []
+
+                    lsa_data = ospf_data[28:pkt_len]
+
+                    for offset in range(0, len(lsa_data), 20):
+                        if offset + 20 > len(lsa_data):
+                            break
+
+                        (
+                            ls_age,
+                            ls_type,
+                            link_state_id,
+                            advertising_router,
+                            ls_sequence,
+                            ls_checksum,
+                            ls_length
+                        ) = struct.unpack(
+                            "!HHIIIHH",
+                            lsa_data[offset:offset + 20]
+                        )
+
+                        lsa_header = {
+                            "ls_age": ls_age,
+                            "ls_type": ls_type,
+                            "link_state_id": socket.inet_ntoa(
+                                struct.pack("!I", link_state_id)
+                            ),
+                            "advertising_router": socket.inet_ntoa(
+                                struct.pack("!I", advertising_router)
+                            ),
+                            "ls_sequence": ls_sequence,
+                            "ls_checksum": ls_checksum,
+                            "ls_length": ls_length
+                        }
+
+                        lsa_headers.append(lsa_header)
 
                     self.logger.info(
                         "\n"
-                        "---------------- OSPFv3 ----------------\n"
+                        "---------------- OSPFv3 DBD ----------------\n"
                         "port=%s\n"
                         "src=%s\n"
                         "dst=%s\n"
@@ -360,14 +599,15 @@ class OSPFv3Controller(app_manager.RyuApp):
                         "  router_id=%s\n"
                         "  area_id=%s\n"
                         "  instance_id=%s\n"
-                        "Hello:\n"
-                        "  interface_id=%s\n"
-                        "  priority=%s\n"
+                        "DBD:\n"
+                        "  interface_mtu=%s\n"
                         "  options=0x%06x\n"
-                        "  hello_interval=%s\n"
-                        "  dead_interval=%s\n"
-                        "  neighbors=%s\n"
-                        "----------------------------------------",
+                        "  flags=0x%02x\n"
+                        "  I=%s\n"
+                        "  M=%s\n"
+                        "  MS=%s\n"
+                        "  dd_sequence=0x%08x\n"
+                        "---------------------------------------------",
                         in_port,
                         ipv6_pkt.src,
                         ipv6_pkt.dst,
@@ -386,10 +626,56 @@ class OSPFv3Controller(app_manager.RyuApp):
                             struct.pack("!I", area_id)
                         ),
                         instance_id,
-                        interface_id,
-                        router_priority,
+                        interface_mtu,
                         options,
-                        hello_interval,
-                        dead_interval,
-                        neighbors if neighbors else "brak"
+                        flags,
+                        i_bit,
+                        m_bit,
+                        ms_bit,
+                        dd_sequence
                     )
+
+                    if lsa_headers:
+                        self.logger.info(
+                            "LSA headers w DBD: %s",
+                            len(lsa_headers)
+                        )
+
+                        for index, lsa in enumerate(lsa_headers, start=1):
+                            self.logger.info(
+                                "  LSA #%s: "
+                                "type=0x%04x "
+                                "link_state_id=%s "
+                                "adv_router=%s "
+                                "seq=0x%08x "
+                                "age=%s "
+                                "length=%s",
+                                index,
+                                lsa["ls_type"],
+                                lsa["link_state_id"],
+                                lsa["advertising_router"],
+                                lsa["ls_sequence"],
+                                lsa["ls_age"],
+                                lsa["ls_length"]
+                            )
+
+                    local_router_id = struct.unpack(
+                        "!I",
+                        socket.inet_aton(OSPF_ROUTER_ID)
+                    )[0]
+
+                    # R1 wysyła początkowy DBD i również deklaruje się jako Master.
+                    if (
+                        i_bit
+                        and m_bit
+                        and ms_bit
+                        and pkt_len == 28
+                        and local_router_id > router_id
+                        and not self.dbd_negotiated
+                    ):
+                        self.logger.info(
+                            "ExStart: Router ID Ryu jest wyzszy. "
+                            "Wysylam wlasny initial DBD."
+                        )
+
+                        self.send_initial_dbd()
