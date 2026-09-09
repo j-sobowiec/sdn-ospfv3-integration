@@ -147,6 +147,68 @@ def build_ospfv3_dbd(dd_sequence, flags=0x07):
 
     return bytes(ospf_packet)
 
+def build_ospfv3_lsr(lsa_requests, dst_ipv6):
+    version = 3
+    pkt_type = 3
+
+    requests_data = b""
+
+    for lsa in lsa_requests:
+        link_state_id = struct.unpack(
+            "!I",
+            socket.inet_aton(lsa["link_state_id"])
+        )[0]
+
+        advertising_router = struct.unpack(
+            "!I",
+            socket.inet_aton(lsa["advertising_router"])
+        )[0]
+
+        requests_data += struct.pack(
+            "!HHII",
+            0,                          # reserved
+            lsa["ls_type"],
+            link_state_id,
+            advertising_router
+        )
+
+    pkt_len = 16 + len(requests_data)
+
+    router_id = struct.unpack(
+        "!I",
+        socket.inet_aton(OSPF_ROUTER_ID)
+    )[0]
+
+    area_id = struct.unpack(
+        "!I",
+        socket.inet_aton(OSPF_AREA_ID)
+    )[0]
+
+    ospf_header = struct.pack(
+        "!BBHIIHBB",
+        version,
+        pkt_type,
+        pkt_len,
+        router_id,
+        area_id,
+        0,                  # checksum tymczasowo 0
+        OSPF_INSTANCE_ID,
+        0
+    )
+
+    ospf_packet = ospf_header + requests_data
+
+    checksum = calculate_ospfv3_checksum(
+        SDN_LINK_LOCAL,
+        dst_ipv6,
+        ospf_packet
+    )
+
+    ospf_packet = bytearray(ospf_packet)
+    ospf_packet[12:14] = struct.pack("!H", checksum)
+
+    return bytes(ospf_packet)
+
 def calculate_ospfv3_checksum(src_ipv6, dst_ipv6, ospf_packet):
     pseudo_header = (
         socket.inet_pton(socket.AF_INET6, src_ipv6) +
@@ -240,6 +302,41 @@ def build_ospfv3_dbd_frame(dd_sequence, flags=0x07):
 
     return ethernet_header + ipv6_header + ospf_packet
 
+def build_ospfv3_lsr_frame(
+    lsa_requests,
+    dst_ipv6,
+    dst_mac
+):
+    ospf_packet = build_ospfv3_lsr(
+        lsa_requests,
+        dst_ipv6
+    )
+
+    ethernet_header = struct.pack(
+        "!6s6sH",
+        mac_to_bytes(dst_mac),
+        mac_to_bytes(SDN_MAC),
+        0x86DD
+    )
+
+    ipv6_header = struct.pack(
+        "!IHBB16s16s",
+        6 << 28,
+        len(ospf_packet),
+        89,
+        1,
+        socket.inet_pton(
+            socket.AF_INET6,
+            SDN_LINK_LOCAL
+        ),
+        socket.inet_pton(
+            socket.AF_INET6,
+            dst_ipv6
+        )
+    )
+
+    return ethernet_header + ipv6_header + ospf_packet
+
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -257,6 +354,10 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.dbd_negotiated = False
         self.dbd_exchange_complete = False
         self.lsa_request_list = []
+
+        self.ospf_neighbor_ipv6 = None
+        self.ospf_neighbor_mac = None
+        self.lsr_sent = False
 
         self.hello_thread = hub.spawn(self.hello_loop)
 
@@ -373,6 +474,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.dbd_negotiated = False
         self.dbd_exchange_complete = False
         self.lsa_request_list = []
+        self.lsr_sent = False
 
         self.dbd_sequence = (
             int(time.time() * 1000)
@@ -391,6 +493,68 @@ class OSPFv3Controller(app_manager.RyuApp):
             self.dbd_sequence
         )
 
+    def send_link_state_request(self):
+        if self.datapath is None or self.ospf_port is None:
+            return
+
+        if self.ospf_neighbor_ipv6 is None:
+            return
+
+        if self.ospf_neighbor_mac is None:
+            return
+
+        if not self.lsa_request_list:
+            self.logger.info(
+                "LSR: brak LSA do pobrania."
+            )
+            return
+
+        datapath = self.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        frame = build_ospfv3_lsr_frame(
+            self.lsa_request_list,
+            self.ospf_neighbor_ipv6,
+            self.ospf_neighbor_mac
+        )
+
+        actions = [
+            parser.OFPActionOutput(self.ospf_port)
+        ]
+
+        packet_out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=ofproto.OFPP_CONTROLLER,
+            actions=actions,
+            data=frame
+        )
+
+        datapath.send_msg(packet_out)
+
+        self.lsr_sent = True
+
+        self.logger.info(
+            "Wyslano OSPFv3 LSR: %d LSA do %s",
+            len(self.lsa_request_list),
+            self.ospf_neighbor_ipv6
+        )
+
+        for index, lsa in enumerate(
+            self.lsa_request_list,
+            start=1
+        ):
+            self.logger.info(
+                "  Request #%d: "
+                "type=0x%04x "
+                "link_state_id=%s "
+                "adv_router=%s",
+                index,
+                lsa["ls_type"],
+                lsa["link_state_id"],
+                lsa["advertising_router"]
+            )
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
@@ -469,7 +633,24 @@ class OSPFv3Controller(app_manager.RyuApp):
                     bytes(ospf_for_checksum)
                 )   
 
-                if version == 3 and pkt_type == 1 and len(ospf_data) >= 36:
+                if checksum != calculated_checksum:
+                    self.logger.warning(
+                        "OSPFv3: niepoprawny checksum "
+                        "received=0x%04x calculated=0x%04x",
+                        checksum,
+                        calculated_checksum
+                    )
+                    return
+
+                router_id_text = socket.inet_ntoa(
+                    struct.pack("!I", router_id)
+                )
+
+                area_id_text = socket.inet_ntoa(
+                    struct.pack("!I", area_id)
+                )
+
+                if version == 3 and pkt_type == 1 and pkt_len >= 36:
 
                     hello_data = ospf_data[16:36]
 
@@ -508,6 +689,8 @@ class OSPFv3Controller(app_manager.RyuApp):
                         )
 
                         self.ospf_port = in_port
+                        self.ospf_neighbor_ipv6 = ipv6_pkt.src
+                        self.ospf_neighbor_mac = eth_pkt.src
 
                         if neighbor_router_id not in self.ospf_neighbors:
 
@@ -797,3 +980,38 @@ class OSPFv3Controller(app_manager.RyuApp):
                             "LSA oczekujace na pobranie: %d",
                             len(self.lsa_request_list)
                         )
+
+                        if (
+                            self.lsa_request_list
+                            and not self.lsr_sent
+                        ):
+                            self.send_link_state_request()
+                elif (
+                    version == 3
+                    and pkt_type == 4
+                    and pkt_len >= 20
+                ):
+                    number_of_lsas = struct.unpack(
+                        "!I",
+                        ospf_data[16:20]
+                    )[0]
+
+                    self.logger.info(
+                        "\n---------------- OSPFv3 LSU ----------------"
+                    )
+                    self.logger.info("port=%s", in_port)
+                    self.logger.info("src=%s", ipv6_pkt.src)
+                    self.logger.info("dst=%s", ipv6_pkt.dst)
+                    self.logger.info(
+                        "length=%d router_id=%s area_id=%s",
+                        pkt_len,
+                        router_id_text,
+                        area_id_text
+                    )
+                    self.logger.info(
+                        "LSU: number_of_lsas=%d",
+                        number_of_lsas
+                    )
+                    self.logger.info(
+                        "---------------------------------------------"
+                    )
