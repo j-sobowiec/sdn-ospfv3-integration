@@ -15,7 +15,7 @@ FRR_IMAGE = os.environ.get("FRR_IMAGE", "frrouting/frr:latest")
 DAEMONS = """\
 zebra=yes
 ospf6d=yes
-vtysh_enable=yes
+vtysh_enable=no
 
 zebra_options="-A 127.0.0.1 -s 90000000"
 ospf6d_options="-A ::1"
@@ -30,11 +30,17 @@ def write_file(node, path, text):
 
 def make_frr_config(hostname, router_id, active_interfaces, passive_interfaces=()):
     """Zbuduj minimalną zintegrowaną konfigurację FRR."""
+
     lines = [
         "frr defaults traditional",
         f"hostname {hostname}",
         "service integrated-vtysh-config",
         "log stdout",
+        "!",
+        "router ospf6",
+        f" ospf6 router-id {router_id}",
+        " log-adjacency-changes",
+        "exit",
         "!",
     ]
 
@@ -43,6 +49,7 @@ def make_frr_config(hostname, router_id, active_interfaces, passive_interfaces=(
             f"interface {interface}",
             " ipv6 ospf6 area 0.0.0.0",
             " ipv6 ospf6 network point-to-point",
+            "exit",
             "!",
         ]
 
@@ -51,17 +58,10 @@ def make_frr_config(hostname, router_id, active_interfaces, passive_interfaces=(
             f"interface {interface}",
             " ipv6 ospf6 area 0.0.0.0",
             " ipv6 ospf6 passive",
+            "exit",
             "!",
         ]
 
-    lines += [
-        "router ospf6",
-        f" ospf6 router-id {router_id}",
-        " log-adjacency-changes",
-        "!",
-        "line vty",
-        "!",
-    ]
     return "\n".join(lines) + "\n"
 
 
@@ -99,6 +99,7 @@ def configure_router(router, addresses, router_id, active_interfaces,
 
 
 def start_frr(router):
+
     """Uruchom FRR i wczytaj /etc/frr/frr.conf."""
     output = router.cmd(
         "if [ -x /usr/lib/frr/frrinit.sh ]; then "
@@ -123,11 +124,6 @@ def start_frr(router):
             f"*** OSTRZEŻENIE: brak gniazd VTY na {router.name}:\n"
             f"{sockets}\n"
         )
-
-    # Wczytaj zintegrowaną konfigurację do działających demonów.
-    load_output = router.cmd("vtysh -b 2>&1")
-    if load_output.strip():
-        info(f"*** {router.name}, vtysh -b: {load_output.strip()}\n")
 
     info(f"*** {router.name}: zakończono start FRR\n")
 

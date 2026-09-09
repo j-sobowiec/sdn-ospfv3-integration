@@ -255,6 +255,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         ) & 0xffffffff
 
         self.dbd_negotiated = False
+        self.dbd_exchange_complete = False
         self.lsa_request_list = []
 
         self.hello_thread = hub.spawn(self.hello_loop)
@@ -330,6 +331,63 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.logger.info(
             "Wyslano initial DBD: "
             "I=1 M=1 MS=1 seq=0x%08x",
+            self.dbd_sequence
+        )
+
+    def send_exchange_dbd(self):
+        if self.datapath is None or self.ospf_port is None:
+            return
+
+        datapath = self.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        frame = build_ospfv3_dbd_frame(
+            self.dbd_sequence,
+            flags=0x01
+        )
+
+        actions = [
+            parser.OFPActionOutput(self.ospf_port)
+        ]
+
+        packet_out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=ofproto.OFPP_CONTROLLER,
+            actions=actions,
+            data=frame
+        )
+
+        datapath.send_msg(packet_out)
+
+        self.logger.info(
+            "Wyslano Exchange DBD: "
+            "I=0 M=0 MS=1 seq=0x%08x",
+            self.dbd_sequence
+        )
+
+    def reset_dbd_state(self, reason):
+        old_sequence = self.dbd_sequence
+
+        self.dbd_negotiated = False
+        self.dbd_exchange_complete = False
+        self.lsa_request_list = []
+
+        self.dbd_sequence = (
+            int(time.time() * 1000)
+        ) & 0xffffffff
+
+        # zabezpieczenie, gdy reset nastąpi w tej samej milisekundzie
+        if self.dbd_sequence == old_sequence:
+            self.dbd_sequence = (
+                old_sequence + 1
+            ) & 0xffffffff
+
+        self.logger.warning(
+            "Reset stanu DBD: %s. "
+            "Nowy DD sequence=0x%08x",
+            reason,
             self.dbd_sequence
         )
 
@@ -665,17 +723,77 @@ class OSPFv3Controller(app_manager.RyuApp):
                     )[0]
 
                     # R1 wysyła początkowy DBD i również deklaruje się jako Master.
-                    if (
+                    is_initial_dbd = (
                         i_bit
                         and m_bit
                         and ms_bit
                         and pkt_len == 28
                         and local_router_id > router_id
-                        and not self.dbd_negotiated
-                    ):
+                    )
+
+                    if is_initial_dbd:
+
+                        # Sąsiad rozpoczął ExStart ponownie po wcześniejszej
+                        # negocjacji lub zakończonym Exchange.
+                        if (
+                            self.dbd_negotiated
+                            or self.dbd_exchange_complete
+                        ):
+                            self.reset_dbd_state(
+                                "sasiad rozpoczal ponownie ExStart"
+                            )
+
                         self.logger.info(
                             "ExStart: Router ID Ryu jest wyzszy. "
-                            "Wysylam wlasny initial DBD."
+                            "Wysylam initial DBD."
                         )
 
                         self.send_initial_dbd()
+
+                    elif (
+                        not self.dbd_negotiated
+                        and not i_bit
+                        and not ms_bit
+                        and dd_sequence == self.dbd_sequence
+                        and local_router_id > router_id
+                    ):
+                        self.logger.info(
+                            "DBD: negocjacja Master/Slave zakonczona. "
+                            "Ryu jest Masterem."
+                        )
+
+                        self.dbd_negotiated = True
+
+                        self.lsa_request_list = list(lsa_headers)
+
+                        self.logger.info(
+                            "DBD: zapisano %d LSA do Link State Request List.",
+                            len(self.lsa_request_list)
+                        )
+
+                        self.dbd_sequence = (
+                            self.dbd_sequence + 1
+                        ) & 0xffffffff
+
+                        self.send_exchange_dbd()
+
+                    elif (
+                        self.dbd_negotiated
+                        and not self.dbd_exchange_complete
+                        and not i_bit
+                        and not m_bit
+                        and not ms_bit
+                        and dd_sequence == self.dbd_sequence
+                    ):
+                        self.dbd_exchange_complete = True
+
+                        self.logger.info(
+                            "DBD: Exchange zakonczony poprawnie. "
+                            "Otrzymano potwierdzenie seq=0x%08x",
+                            dd_sequence
+                        )
+
+                        self.logger.info(
+                            "LSA oczekujace na pobranie: %d",
+                            len(self.lsa_request_list)
+                        )
