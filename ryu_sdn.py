@@ -337,6 +337,39 @@ def build_ospfv3_lsr_frame(
 
     return ethernet_header + ipv6_header + ospf_packet
 
+def ospfv3_lsa_type_description(ls_type):
+    """Zwróć czytelną nazwę typu LSA oraz jego flooding scope."""
+
+    lsa_names = {
+        0x2001: "Router-LSA",
+        0x2002: "Network-LSA",
+        0x2003: "Inter-Area-Prefix-LSA",
+        0x2004: "Inter-Area-Router-LSA",
+        0x4005: "AS-External-LSA",
+        0x2007: "NSSA-LSA",
+        0x0008: "Link-LSA",
+        0x2009: "Intra-Area-Prefix-LSA",
+    }
+
+    scope_names = {
+        0x0000: "Link-local Scope",
+        0x2000: "Area Scope",
+        0x4000: "AS Scope",
+        0x6000: "Reserved Scope",
+    }
+
+    name = lsa_names.get(
+        ls_type,
+        f"Unknown-LSA(function={ls_type & 0x1fff})"
+    )
+
+    scope = scope_names.get(
+        ls_type & 0x6000,
+        "Unknown Scope"
+    )
+
+    return f"{name}, {scope}"
+
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -547,11 +580,12 @@ class OSPFv3Controller(app_manager.RyuApp):
         ):
             self.logger.info(
                 "  Request #%d: "
-                "type=0x%04x "
+                "type=0x%04x (%s) "
                 "link_state_id=%s "
                 "adv_router=%s",
                 index,
                 lsa["ls_type"],
+                ospfv3_lsa_type_description(lsa["ls_type"]),
                 lsa["link_state_id"],
                 lsa["advertising_router"]
             )
@@ -885,7 +919,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                         for index, lsa in enumerate(lsa_headers, start=1):
                             self.logger.info(
                                 "  LSA #%s: "
-                                "type=0x%04x "
+                                "type=0x%04x (%s) "
                                 "link_state_id=%s "
                                 "adv_router=%s "
                                 "seq=0x%08x "
@@ -893,6 +927,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 "length=%s",
                                 index,
                                 lsa["ls_type"],
+                                ospfv3_lsa_type_description(lsa["ls_type"]),
                                 lsa["link_state_id"],
                                 lsa["advertising_router"],
                                 lsa["ls_sequence"],
@@ -986,32 +1021,134 @@ class OSPFv3Controller(app_manager.RyuApp):
                             and not self.lsr_sent
                         ):
                             self.send_link_state_request()
-                elif (
-                    version == 3
-                    and pkt_type == 4
-                    and pkt_len >= 20
-                ):
+                elif version == 3 and pkt_type == 4 and pkt_len >= 20:
+
                     number_of_lsas = struct.unpack(
                         "!I",
                         ospf_data[16:20]
                     )[0]
 
+                    lsu_lsa_headers = []
+
+                    # 16 B = OSPFv3 header
+                    #  4 B = liczba LSA
+                    # ------------------
+                    # 20 B = poczatek pierwszego LSA
+                    offset = 20
+
+                    for index in range(number_of_lsas):
+
+                        # Każde LSA musi mieć przynajmniej 20-bajtowy nagłówek.
+                        if offset + 20 > pkt_len:
+                            self.logger.warning(
+                                "LSU: za malo danych na naglowek LSA #%d",
+                                index + 1
+                            )
+                            return
+
+                        raw_lsa_header = bytes(
+                            ospf_data[offset:offset + 20]
+                        )
+
+                        (
+                            ls_age,
+                            ls_type,
+                            link_state_id,
+                            advertising_router,
+                            ls_sequence,
+                            ls_checksum,
+                            ls_length
+                        ) = struct.unpack(
+                            "!HHIIIHH",
+                            raw_lsa_header
+                        )
+
+                        # Dlugosc LSA zawiera jego 20-bajtowy naglowek.
+                        if ls_length < 20:
+                            self.logger.warning(
+                                "LSU: niepoprawna dlugosc LSA #%d: %d",
+                                index + 1,
+                                ls_length
+                            )
+                            return
+
+                        if offset + ls_length > pkt_len:
+                            self.logger.warning(
+                                "LSU: LSA #%d wychodzi poza pakiet "
+                                "(offset=%d length=%d pkt_len=%d)",
+                                index + 1,
+                                offset,
+                                ls_length,
+                                pkt_len
+                            )
+                            return
+
+                        lsa_header = {
+                            "ls_age": ls_age,
+                            "ls_type": ls_type,
+                            "link_state_id": socket.inet_ntoa(
+                                struct.pack("!I", link_state_id)
+                            ),
+                            "advertising_router": socket.inet_ntoa(
+                                struct.pack("!I", advertising_router)
+                            ),
+                            "ls_sequence": ls_sequence,
+                            "ls_checksum": ls_checksum,
+                            "ls_length": ls_length,
+
+                            # Przyda się za chwilę do LSAck.
+                            "raw_header": raw_lsa_header
+                        }
+
+                        lsu_lsa_headers.append(lsa_header)
+
+                        # UWAGA:
+                        # przechodzimy o CALA dlugosc LSA,
+                        # a nie o 20 bajtow.
+                        offset += ls_length
+
                     self.logger.info(
-                        "\n---------------- OSPFv3 LSU ----------------"
-                    )
-                    self.logger.info("port=%s", in_port)
-                    self.logger.info("src=%s", ipv6_pkt.src)
-                    self.logger.info("dst=%s", ipv6_pkt.dst)
-                    self.logger.info(
-                        "length=%d router_id=%s area_id=%s",
+                        "\n---------------- OSPFv3 LSU ----------------\n"
+                        "port=%s\n"
+                        "src=%s\n"
+                        "dst=%s\n"
+                        "length=%d\n"
+                        "router_id=%s\n"
+                        "area_id=%s\n"
+                        "LSU: number_of_lsas=%d",
+                        in_port,
+                        ipv6_pkt.src,
+                        ipv6_pkt.dst,
                         pkt_len,
                         router_id_text,
-                        area_id_text
-                    )
-                    self.logger.info(
-                        "LSU: number_of_lsas=%d",
+                        area_id_text,
                         number_of_lsas
                     )
+
+                    for index, lsa in enumerate(
+                        lsu_lsa_headers,
+                        start=1
+                    ):
+                        self.logger.info(
+                            "  LSA #%d: "
+                            "type=0x%04x (%s) "
+                            "link_state_id=%s "
+                            "adv_router=%s "
+                            "seq=0x%08x "
+                            "age=%d "
+                            "checksum=0x%04x "
+                            "length=%d",
+                            index,
+                            lsa["ls_type"],
+                            ospfv3_lsa_type_description(lsa["ls_type"]),
+                            lsa["link_state_id"],
+                            lsa["advertising_router"],
+                            lsa["ls_sequence"],
+                            lsa["ls_age"],
+                            lsa["ls_checksum"],
+                            lsa["ls_length"]
+                        )
+
                     self.logger.info(
                         "---------------------------------------------"
                     )
