@@ -209,6 +209,52 @@ def build_ospfv3_lsr(lsa_requests, dst_ipv6):
 
     return bytes(ospf_packet)
 
+def build_ospfv3_lsack(lsa_headers, dst_ipv6):
+    version = 3
+    pkt_type = 5
+
+    ack_data = b""
+
+    for lsa in lsa_headers:
+        ack_data += lsa["raw_header"]
+
+    pkt_len = 16 + len(ack_data)
+
+    router_id = struct.unpack(
+        "!I",
+        socket.inet_aton(OSPF_ROUTER_ID)
+    )[0]
+
+    area_id = struct.unpack(
+        "!I",
+        socket.inet_aton(OSPF_AREA_ID)
+    )[0]
+
+    ospf_header = struct.pack(
+        "!BBHIIHBB",
+        version,
+        pkt_type,
+        pkt_len,
+        router_id,
+        area_id,
+        0,                  # checksum na razie 0
+        OSPF_INSTANCE_ID,
+        0
+    )
+
+    ospf_packet = ospf_header + ack_data
+
+    checksum = calculate_ospfv3_checksum(
+        SDN_LINK_LOCAL,
+        dst_ipv6,
+        ospf_packet
+    )
+
+    ospf_packet = bytearray(ospf_packet)
+    ospf_packet[12:14] = struct.pack("!H", checksum)
+
+    return bytes(ospf_packet)
+
 def calculate_ospfv3_checksum(src_ipv6, dst_ipv6, ospf_packet):
     pseudo_header = (
         socket.inet_pton(socket.AF_INET6, src_ipv6) +
@@ -309,6 +355,41 @@ def build_ospfv3_lsr_frame(
 ):
     ospf_packet = build_ospfv3_lsr(
         lsa_requests,
+        dst_ipv6
+    )
+
+    ethernet_header = struct.pack(
+        "!6s6sH",
+        mac_to_bytes(dst_mac),
+        mac_to_bytes(SDN_MAC),
+        0x86DD
+    )
+
+    ipv6_header = struct.pack(
+        "!IHBB16s16s",
+        6 << 28,
+        len(ospf_packet),
+        89,
+        1,
+        socket.inet_pton(
+            socket.AF_INET6,
+            SDN_LINK_LOCAL
+        ),
+        socket.inet_pton(
+            socket.AF_INET6,
+            dst_ipv6
+        )
+    )
+
+    return ethernet_header + ipv6_header + ospf_packet
+
+def build_ospfv3_lsack_frame(
+    lsa_headers,
+    dst_ipv6,
+    dst_mac
+):
+    ospf_packet = build_ospfv3_lsack(
+        lsa_headers,
         dst_ipv6
     )
 
@@ -589,6 +670,70 @@ class OSPFv3Controller(app_manager.RyuApp):
                 lsa["link_state_id"],
                 lsa["advertising_router"]
             )
+
+    def send_ls_ack(self, lsa_headers):
+        if self.datapath is None or self.ospf_port is None:
+            return
+
+        if self.ospf_neighbor_ipv6 is None:
+            return
+
+        if self.ospf_neighbor_mac is None:
+            return
+
+        if not lsa_headers:
+            return
+
+        datapath = self.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        frame = build_ospfv3_lsack_frame(
+            lsa_headers,
+            self.ospf_neighbor_ipv6,
+            self.ospf_neighbor_mac
+        )
+
+        actions = [
+            parser.OFPActionOutput(self.ospf_port)
+        ]
+
+        packet_out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=ofproto.OFPP_CONTROLLER,
+            actions=actions,
+            data=frame
+        )
+
+        datapath.send_msg(packet_out)
+
+        self.logger.info(
+            "Wyslano OSPFv3 LSAck: %d LSA do %s",
+            len(lsa_headers),
+            self.ospf_neighbor_ipv6
+        )
+
+        for index, lsa in enumerate(
+            lsa_headers,
+            start=1
+        ):
+            self.logger.info(
+                "  ACK #%d: "
+                "type=0x%04x (%s) "
+                "link_state_id=%s "
+                "adv_router=%s "
+                "seq=0x%08x",
+                index,
+                lsa["ls_type"],
+                ospfv3_lsa_type_description(
+                    lsa["ls_type"]
+                ),
+                lsa["link_state_id"],
+                lsa["advertising_router"],
+                lsa["ls_sequence"]
+            )
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
@@ -1152,3 +1297,6 @@ class OSPFv3Controller(app_manager.RyuApp):
                     self.logger.info(
                         "---------------------------------------------"
                     )
+
+                    if lsu_lsa_headers:
+                        self.send_ls_ack(lsu_lsa_headers)
