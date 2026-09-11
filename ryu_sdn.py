@@ -451,6 +451,106 @@ def ospfv3_lsa_type_description(ls_type):
 
     return f"{name}, {scope}"
 
+def parse_ospfv3_router_lsa(raw_lsa):
+    """
+    Parsuje pelne OSPFv3 Router-LSA (LS Type 0x2001).
+
+    raw_lsa zawiera:
+      20 B - wspolny naglowek LSA
+       4 B - Flags + Options
+      Nx16 B - opisy linkow
+    """
+
+    if len(raw_lsa) < 24:
+        raise ValueError(
+            f"Router-LSA jest za krotkie: {len(raw_lsa)} B"
+        )
+
+    # Pole Length znajduje sie w ostatnich 2 bajtach
+    # wspolnego 20-bajtowego naglowka LSA.
+    ls_length = struct.unpack(
+        "!H",
+        raw_lsa[18:20]
+    )[0]
+
+    if ls_length != len(raw_lsa):
+        raise ValueError(
+            f"Router-LSA: LS Length={ls_length}, "
+            f"rzeczywista dlugosc={len(raw_lsa)}"
+        )
+
+    # Pierwszy bajt body = flagi routera.
+    flags = raw_lsa[20]
+
+    # Kolejne 3 bajty = Options.
+    options = int.from_bytes(
+        raw_lsa[21:24],
+        byteorder="big"
+    )
+
+    link_data_length = ls_length - 24
+
+    # Kazdy opis linku Router-LSA ma dokladnie 16 B.
+    if link_data_length % 16 != 0:
+        raise ValueError(
+            "Router-LSA: czesc z opisami linkow "
+            f"ma niepoprawna dlugosc {link_data_length} B"
+        )
+
+    links = []
+
+    offset = 24
+
+    while offset < ls_length:
+        (
+            link_type,
+            reserved,
+            metric,
+            interface_id,
+            neighbor_interface_id,
+            neighbor_router_id
+        ) = struct.unpack(
+            "!BBHIII",
+            raw_lsa[offset:offset + 16]
+        )
+
+        link_type_names = {
+            1: "Point-to-Point",
+            2: "Transit Network",
+            3: "Reserved",
+            4: "Virtual Link",
+        }
+
+        links.append({
+            "type": link_type,
+            "type_name": link_type_names.get(
+                link_type,
+                "Unknown"
+            ),
+            "reserved": reserved,
+            "metric": metric,
+
+            "interface_id": socket.inet_ntoa(
+                struct.pack("!I", interface_id)
+            ),
+
+            "neighbor_interface_id": socket.inet_ntoa(
+                struct.pack("!I", neighbor_interface_id)
+            ),
+
+            "neighbor_router_id": socket.inet_ntoa(
+                struct.pack("!I", neighbor_router_id)
+            ),
+        })
+
+        offset += 16
+
+    return {
+        "flags": flags,
+        "options": options,
+        "links": links,
+    }
+
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -1227,7 +1327,11 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 pkt_len
                             )
                             return
-
+                        
+                        raw_lsa = bytes(
+                            ospf_data[offset:offset + ls_length]
+                        )
+                        
                         lsa_header = {
                             "ls_age": ls_age,
                             "ls_type": ls_type,
@@ -1245,6 +1349,19 @@ class OSPFv3Controller(app_manager.RyuApp):
                             "raw_header": raw_lsa_header
                         }
 
+                        if ls_type == 0x2001:
+                            try:
+                                lsa_header["router_lsa"] = (
+                                    parse_ospfv3_router_lsa(raw_lsa)
+                                )
+                            except ValueError as exc:
+                                self.logger.warning(
+                                    "LSU: blad parsowania Router-LSA #%d: %s",
+                                    index + 1,
+                                    exc
+                                )
+                                return
+    
                         lsu_lsa_headers.append(lsa_header)
 
                         # UWAGA:
@@ -1293,6 +1410,39 @@ class OSPFv3Controller(app_manager.RyuApp):
                             lsa["ls_checksum"],
                             lsa["ls_length"]
                         )
+
+                        if lsa["ls_type"] == 0x2001:
+                            router_lsa = lsa["router_lsa"]
+
+                            self.logger.info(
+                                "    Router-LSA body: "
+                                "flags=0x%02x "
+                                "options=0x%06x "
+                                "links=%d",
+                                router_lsa["flags"],
+                                router_lsa["options"],
+                                len(router_lsa["links"])
+                            )
+
+                            for link_index, link in enumerate(
+                                router_lsa["links"],
+                                start=1
+                            ):
+                                self.logger.info(
+                                    "      Link #%d: "
+                                    "type=%d (%s) "
+                                    "metric=%d "
+                                    "interface_id=%s "
+                                    "neighbor_interface_id=%s "
+                                    "neighbor_router_id=%s",
+                                    link_index,
+                                    link["type"],
+                                    link["type_name"],
+                                    link["metric"],
+                                    link["interface_id"],
+                                    link["neighbor_interface_id"],
+                                    link["neighbor_router_id"]
+                                )
 
                     self.logger.info(
                         "---------------------------------------------"
