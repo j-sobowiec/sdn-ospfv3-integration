@@ -1077,7 +1077,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                     received,
                     request
                 )
-                
+
                 if comparison >= 0:
                     request_satisfied = True
                     break
@@ -1140,30 +1140,10 @@ class OSPFv3Controller(app_manager.RyuApp):
         datapath.send_msg(packet_out)
 
         self.logger.info(
-            "Wyslano OSPFv3 LSAck: %d LSA do %s",
-            len(lsa_headers),
-            self.ospf_neighbor_ipv6
+            "[OSPF][LSAck TX] to=%s count=%d",
+            self.ospf_neighbor_ipv6,
+            len(lsa_headers)
         )
-
-        for index, lsa in enumerate(
-            lsa_headers,
-            start=1
-        ):
-            self.logger.info(
-                "  ACK #%d: "
-                "type=0x%04x (%s) "
-                "link_state_id=%s "
-                "adv_router=%s "
-                "seq=0x%08x",
-                index,
-                lsa["ls_type"],
-                ospfv3_lsa_type_description(
-                    lsa["ls_type"]
-                ),
-                lsa["link_state_id"],
-                lsa["advertising_router"],
-                lsa["ls_sequence"]
-            )
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -1201,6 +1181,217 @@ class OSPFv3Controller(app_manager.RyuApp):
             "Polaczono switch DPID=%016x",
             datapath.id
         )
+
+    def log_hello(
+        self,
+        in_port,
+        ipv6_pkt,
+        router_id_text,
+        area_id_text,
+        interface_id,
+        priority,
+        options,
+        hello_interval,
+        dead_interval,
+        neighbors
+    ):
+        if neighbors:
+            neighbors_text = ", ".join(neighbors)
+        else:
+            neighbors_text = "-"
+
+        self.logger.info(
+            "\n[OSPF][HELLO RX] "
+            "router=%s src=%s port=%s area=%s",
+            router_id_text,
+            ipv6_pkt.src,
+            in_port,
+            area_id_text
+        )
+
+        self.logger.info(
+            "  ifid=%s priority=%d "
+            "hello=%ds dead=%ds options=0x%06x",
+            interface_id,
+            priority,
+            hello_interval,
+            dead_interval,
+            options
+        )
+
+        self.logger.info(
+            "  neighbors=%s",
+            neighbors_text
+        )
+
+    def log_dbd(
+        self,
+        in_port,
+        ipv6_pkt,
+        router_id_text,
+        area_id_text,
+        interface_mtu,
+        options,
+        i_bit,
+        m_bit,
+        ms_bit,
+        dd_sequence,
+        lsa_headers
+    ):
+        flags = []
+
+        if i_bit:
+            flags.append("I")
+
+        if m_bit:
+            flags.append("M")
+
+        if ms_bit:
+            flags.append("MS")
+
+        flags_text = ",".join(flags) if flags else "-"
+
+        self.logger.info(
+            "\n[OSPF][DBD RX] "
+            "router=%s src=%s port=%s area=%s",
+            router_id_text,
+            ipv6_pkt.src,
+            in_port,
+            area_id_text
+        )
+
+        self.logger.info(
+            "  mtu=%d seq=0x%08x "
+            "flags=%s options=0x%06x summaries=%d",
+            interface_mtu,
+            dd_sequence,
+            flags_text,
+            options,
+            len(lsa_headers)
+        )
+
+        for lsa in lsa_headers:
+            self.logger.info(
+                "    -> %s "
+                "adv=%s lsid=%s seq=0x%08x",
+                ospfv3_lsa_type_description(
+                    lsa["ls_type"]
+                ),
+                lsa["advertising_router"],
+                lsa["link_state_id"],
+                lsa["ls_sequence"]
+            )
+            
+    def log_lsu(
+        self,
+        in_port,
+        ipv6_pkt,
+        pkt_len,
+        router_id_text,
+        area_id_text,
+        lsa_headers
+    ):
+        self.logger.info(
+            "\n[OSPF][LSU RX] "
+            "router=%s src=%s port=%s area=%s "
+            "lsas=%d len=%d",
+            router_id_text,
+            ipv6_pkt.src,
+            in_port,
+            area_id_text,
+            len(lsa_headers),
+            pkt_len
+        )
+
+        for index, lsa in enumerate(
+            lsa_headers,
+            start=1
+        ):
+            lsa_type = lsa["ls_type"]
+
+            self.logger.info(
+                "  #%d %s "
+                "adv=%s "
+                "lsid=%s "
+                "seq=0x%08x "
+                "age=%d",
+                index,
+                ospfv3_lsa_type_description(lsa_type),
+                lsa["advertising_router"],
+                lsa["link_state_id"],
+                lsa["ls_sequence"],
+                lsa["ls_age"]
+            )
+
+            # Router-LSA
+            if lsa_type == 0x2001:
+                router_lsa = lsa["router_lsa"]
+
+                self.logger.info(
+                    "     links=%d flags=0x%02x options=0x%06x",
+                    len(router_lsa["links"]),
+                    router_lsa["flags"],
+                    router_lsa["options"]
+                )
+
+                for link in router_lsa["links"]:
+                    self.logger.info(
+                        "       -> router=%s "
+                        "cost=%d "
+                        "if=%s "
+                        "neighbor_if=%s",
+                        link["neighbor_router_id"],
+                        link["metric"],
+                        link["interface_id"],
+                        link["neighbor_interface_id"]
+                    )
+
+            # Link-LSA
+            elif lsa_type == 0x0008:
+                link_lsa = lsa["link_lsa"]
+
+                self.logger.info(
+                    "     link_local=%s "
+                    "priority=%d "
+                    "prefixes=%d",
+                    link_lsa["link_local_address"],
+                    link_lsa["router_priority"],
+                    link_lsa["number_of_prefixes"]
+                )
+
+                for prefix in link_lsa["prefixes"]:
+                    self.logger.info(
+                        "       -> %s/%d",
+                        prefix["prefix"],
+                        prefix["prefix_length"]
+                    )
+
+            # Intra-Area-Prefix-LSA
+            elif lsa_type == 0x2009:
+                prefix_lsa = lsa[
+                    "intra_area_prefix_lsa"
+                ]
+
+                self.logger.info(
+                    "     referenced=%s "
+                    "router=%s "
+                    "prefixes=%d",
+                    ospfv3_lsa_type_description(
+                        prefix_lsa["referenced_ls_type"]
+                    ),
+                    prefix_lsa[
+                        "referenced_advertising_router"
+                    ],
+                    prefix_lsa["number_of_prefixes"]
+                )
+
+                for prefix in prefix_lsa["prefixes"]:
+                    self.logger.info(
+                        "       -> %s/%d cost=%d",
+                        prefix["prefix"],
+                        prefix["prefix_length"],
+                        prefix["metric"]
+                    )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -1726,145 +1917,13 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                         offset += ls_length
 
-                    self.logger.info(
-                        "\n---------------- OSPFv3 LSU ----------------\n"
-                        "port=%s\n"
-                        "src=%s\n"
-                        "dst=%s\n"
-                        "length=%d\n"
-                        "router_id=%s\n"
-                        "area_id=%s\n"
-                        "LSU: number_of_lsas=%d",
+                    self.log_lsu(
                         in_port,
-                        ipv6_pkt.src,
-                        ipv6_pkt.dst,
+                        ipv6_pkt,
                         pkt_len,
                         router_id_text,
                         area_id_text,
-                        number_of_lsas
-                    )
-
-                    for index, lsa in enumerate(
-                        lsu_lsa_headers,
-                        start=1
-                    ):
-                        self.logger.info(
-                            "  LSA #%d: "
-                            "type=0x%04x (%s) "
-                            "link_state_id=%s "
-                            "adv_router=%s "
-                            "seq=0x%08x "
-                            "age=%d "
-                            "checksum=0x%04x "
-                            "length=%d",
-                            index,
-                            lsa["ls_type"],
-                            ospfv3_lsa_type_description(lsa["ls_type"]),
-                            lsa["link_state_id"],
-                            lsa["advertising_router"],
-                            lsa["ls_sequence"],
-                            lsa["ls_age"],
-                            lsa["ls_checksum"],
-                            lsa["ls_length"]
-                        )
-
-                        if lsa["ls_type"] == 0x2001:
-                            router_lsa = lsa["router_lsa"]
-
-                            self.logger.info(
-                                "    Router-LSA body: "
-                                "flags=0x%02x "
-                                "options=0x%06x "
-                                "links=%d",
-                                router_lsa["flags"],
-                                router_lsa["options"],
-                                len(router_lsa["links"])
-                            )
-    
-                            for link_index, link in enumerate(
-                                router_lsa["links"],
-                                start=1
-                            ):
-                                self.logger.info(
-                                    "      Link #%d: "
-                                    "type=%d (%s) "
-                                    "metric=%d "
-                                    "interface_id=%s "
-                                    "neighbor_interface_id=%s "
-                                    "neighbor_router_id=%s",
-                                    link_index,
-                                    link["type"],
-                                    link["type_name"],
-                                    link["metric"],
-                                    link["interface_id"],
-                                    link["neighbor_interface_id"],
-                                    link["neighbor_router_id"]
-                                )
-
-                        elif lsa["ls_type"] == 0x0008:
-                            link_lsa = lsa["link_lsa"]
-
-                            self.logger.info(
-                                "    Link-LSA body: "
-                                "priority=%d "
-                                "options=0x%06x "
-                                "link_local=%s "
-                                "prefixes=%d",
-                                link_lsa["router_priority"],
-                                link_lsa["options"],
-                                link_lsa["link_local_address"],
-                                link_lsa["number_of_prefixes"]
-                            )
-
-                            for prefix_index, prefix in enumerate(
-                                link_lsa["prefixes"],
-                                start=1
-                            ):
-                                self.logger.info(
-                                    "      Prefix #%d: "
-                                    "%s/%d "
-                                    "options=0x%02x",
-                                    prefix_index,
-                                    prefix["prefix"],
-                                    prefix["prefix_length"],                                        
-                                    prefix["prefix_options"]
-                                )                          
-
-                        elif lsa["ls_type"] == 0x2009:
-                            prefix_lsa = lsa["intra_area_prefix_lsa"]
-
-                            self.logger.info(
-                                "    Intra-Area-Prefix-LSA body: "
-                                "referenced_type=0x%04x (%s) "
-                                "referenced_lsid=%s "
-                                "referenced_router=%s "
-                                "prefixes=%d",
-                                prefix_lsa["referenced_ls_type"],
-                                ospfv3_lsa_type_description(
-                                    prefix_lsa["referenced_ls_type"]
-                                ),
-                                prefix_lsa["referenced_link_state_id"],
-                                prefix_lsa["referenced_advertising_router"],
-                                prefix_lsa["number_of_prefixes"]
-                            )
-
-                            for prefix_index, prefix in enumerate(
-                                prefix_lsa["prefixes"],
-                                start=1
-                            ):
-                                self.logger.info(
-                                    "      Prefix #%d: "
-                                    "%s/%d "
-                                    "metric=%d "
-                                    "options=0x%02x",
-                                    prefix_index,
-                                    prefix["prefix"],
-                                    prefix["prefix_length"],
-                                    prefix["metric"],
-                                    prefix["prefix_options"]
-                                )
-                    self.logger.info(
-                        "---------------------------------------------"
+                        lsu_lsa_headers
                     )
 
                     if lsu_lsa_headers:
