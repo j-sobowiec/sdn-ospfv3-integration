@@ -27,6 +27,8 @@ SDN_MAC = "02:00:00:00:00:01"
 SDN_LINK_LOCAL = "fe80::10"
 
 OSPF_INTERFACE_MTU = 1500
+OSPF_MAX_AGE = 3600
+OSPF_MAX_AGE_DIFF = 900
 
 def build_ospfv3_hello(neighbors=()):
     version = 3
@@ -755,6 +757,78 @@ def parse_ospfv3_intra_area_prefix_lsa(raw_lsa):
         "prefixes": prefixes,
     }
 
+def lsa_sequence_signed(sequence):
+    """
+    LS Sequence Number w OSPF jest porownywany jako signed 32-bit.
+    """
+    return struct.unpack(
+        "!i",
+        struct.pack("!I", sequence)
+    )[0]
+
+
+def compare_lsa_instances(first, second):
+    """
+    Porownuje dwie instancje tego samego LSA.
+
+    Zwraca:
+       1  -> first jest nowsze
+       0  -> obie instancje sa traktowane jako identyczne
+      -1  -> second jest nowsze
+    """
+
+    first_seq = lsa_sequence_signed(
+        first["ls_sequence"]
+    )
+
+    second_seq = lsa_sequence_signed(
+        second["ls_sequence"]
+    )
+
+    # 1. LS Sequence Number
+    if first_seq > second_seq:
+        return 1
+
+    if first_seq < second_seq:
+        return -1
+
+    # 2. LS Checksum
+    if first["ls_checksum"] > second["ls_checksum"]:
+        return 1
+
+    if first["ls_checksum"] < second["ls_checksum"]:
+        return -1
+
+    first_age = first["ls_age"]
+    second_age = second["ls_age"]
+
+    # 3. MaxAge
+    if (
+        first_age == OSPF_MAX_AGE
+        and second_age != OSPF_MAX_AGE
+    ):
+        return 1
+
+    if (
+        second_age == OSPF_MAX_AGE
+        and first_age != OSPF_MAX_AGE
+    ):
+        return -1
+
+    # 4. Duza roznica LS Age:
+    # mlodsze LSA (mniejsze age) jest nowsze.
+    if abs(first_age - second_age) > OSPF_MAX_AGE_DIFF:
+
+        if first_age < second_age:
+            return 1
+
+        if first_age > second_age:
+            return -1
+
+    # 5. W pozostalych przypadkach
+    # instancje sa traktowane jako identyczne.
+    return 0
+
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -999,19 +1073,12 @@ class OSPFv3Controller(app_manager.RyuApp):
                 if not same_lsa:
                     continue
 
-                # Sequence Number w OSPF jest wartością signed 32-bit.
-                request_seq = struct.unpack(
-                    "!i",
-                    struct.pack("!I", request["ls_sequence"])
-                )[0]
-
-                received_seq = struct.unpack(
-                    "!i",
-                    struct.pack("!I", received["ls_sequence"])
-                )[0]
-
-                # Ta sama lub nowsza instancja spełnia nasze żądanie.
-                if received_seq >= request_seq:
+                comparison = compare_lsa_instances(
+                    received,
+                    request
+                )
+                
+                if comparison >= 0:
                     request_satisfied = True
                     break
 
