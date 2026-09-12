@@ -645,6 +645,116 @@ def parse_ospfv3_link_lsa(raw_lsa):
         "prefixes": prefixes,
     }
 
+def parse_ospfv3_intra_area_prefix_lsa(raw_lsa):
+    if len(raw_lsa) < 32:
+        raise ValueError(
+            f"Intra-Area-Prefix-LSA jest za krotkie: {len(raw_lsa)} B"
+        )
+
+    # Stala czesc body zaczyna sie po 20-bajtowym LSA header.
+    number_of_prefixes, referenced_ls_type = struct.unpack(
+        "!HH",
+        raw_lsa[20:24]
+    )
+
+    referenced_link_state_id = struct.unpack(
+        "!I",
+        raw_lsa[24:28]
+    )[0]
+
+    referenced_advertising_router = struct.unpack(
+        "!I",
+        raw_lsa[28:32]
+    )[0]
+
+    prefixes = []
+
+    # 20 B LSA header
+    # 12 B stalej czesci Intra-Area-Prefix-LSA
+    offset = 32
+
+    for index in range(number_of_prefixes):
+
+        # PrefixLength + PrefixOptions + Metric = 4 B
+        if offset + 4 > len(raw_lsa):
+            raise ValueError(
+                f"Intra-Area-Prefix-LSA: "
+                f"za malo danych na prefix #{index + 1}"
+            )
+
+        prefix_length = raw_lsa[offset]
+        prefix_options = raw_lsa[offset + 1]
+
+        metric = struct.unpack(
+            "!H",
+            raw_lsa[offset + 2:offset + 4]
+        )[0]
+
+        if prefix_length > 128:
+            raise ValueError(
+                f"Intra-Area-Prefix-LSA: "
+                f"niepoprawny prefix length {prefix_length}"
+            )
+
+        # Prefix jest kodowany w wielokrotnosci 32 bitow.
+        prefix_bytes_length = (
+            (prefix_length + 31) // 32
+        ) * 4
+
+        prefix_start = offset + 4
+        prefix_end = prefix_start + prefix_bytes_length
+
+        if prefix_end > len(raw_lsa):
+            raise ValueError(
+                f"Intra-Area-Prefix-LSA: "
+                f"prefix #{index + 1} wychodzi poza LSA"
+            )
+
+        prefix_bytes = bytes(
+            raw_lsa[prefix_start:prefix_end]
+        )
+
+        full_ipv6 = prefix_bytes.ljust(
+            16,
+            b"\x00"
+        )
+
+        prefix_address = socket.inet_ntop(
+            socket.AF_INET6,
+            full_ipv6
+        )
+
+        prefixes.append({
+            "prefix": prefix_address,
+            "prefix_length": prefix_length,
+            "prefix_options": prefix_options,
+            "metric": metric,
+        })
+
+        offset = prefix_end
+
+    return {
+        "number_of_prefixes": number_of_prefixes,
+
+        "referenced_ls_type": referenced_ls_type,
+
+        "referenced_link_state_id": socket.inet_ntoa(
+            struct.pack(
+                "!I",
+                referenced_link_state_id
+            )
+        ),
+
+        "referenced_advertising_router": socket.inet_ntoa(
+            struct.pack(
+                "!I",
+                referenced_advertising_router
+            )
+        ),
+
+        "prefixes": prefixes,
+    }
+
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -863,6 +973,66 @@ class OSPFv3Controller(app_manager.RyuApp):
                 ospfv3_lsa_type_description(lsa["ls_type"]),
                 lsa["link_state_id"],
                 lsa["advertising_router"]
+            )
+
+    def update_lsa_request_list(self, received_lsa_headers):
+        """
+        Usuwa z lsa_request_list te LSA, które zostały
+        już odebrane w LSU.
+        """
+        if not self.lsa_request_list:
+            return
+
+        remaining_requests = []
+
+        for request in self.lsa_request_list:
+            request_satisfied = False
+
+            for received in received_lsa_headers:
+                same_lsa = (
+                    request["ls_type"] == received["ls_type"]
+                    and request["link_state_id"] == received["link_state_id"]
+                    and request["advertising_router"]
+                    == received["advertising_router"]
+                )
+
+                if not same_lsa:
+                    continue
+
+                # Sequence Number w OSPF jest wartością signed 32-bit.
+                request_seq = struct.unpack(
+                    "!i",
+                    struct.pack("!I", request["ls_sequence"])
+                )[0]
+
+                received_seq = struct.unpack(
+                    "!i",
+                    struct.pack("!I", received["ls_sequence"])
+                )[0]
+
+                # Ta sama lub nowsza instancja spełnia nasze żądanie.
+                if received_seq >= request_seq:
+                    request_satisfied = True
+                    break
+
+            if not request_satisfied:
+                remaining_requests.append(request)
+
+        old_count = len(self.lsa_request_list)
+        new_count = len(remaining_requests)
+
+        self.lsa_request_list = remaining_requests
+
+        if new_count != old_count:
+            self.logger.info(
+                "LSR: odebrano %d oczekiwanych LSA, pozostalo %d",
+                old_count - new_count,
+                new_count
+            )
+
+        if old_count > 0 and new_count == 0:
+            self.logger.info(
+                "LSR: wszystkie zadane LSA zostaly odebrane"
             )
 
     def send_ls_ack(self, lsa_headers):
@@ -1469,6 +1639,22 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 )
                                 return
                             
+                        elif ls_type == 0x2009:
+                            try:
+                                lsa_header["intra_area_prefix_lsa"] = (
+                                    parse_ospfv3_intra_area_prefix_lsa(
+                                        raw_lsa
+                                    )
+                                )
+                            except ValueError as exc:
+                                self.logger.warning(
+                                    "LSU: blad parsowania "
+                                    "Intra-Area-Prefix-LSA #%d: %s",
+                                    index + 1,
+                                    exc
+                                )
+                                return
+                            
                         lsu_lsa_headers.append(lsa_header)
 
                         offset += ls_length
@@ -1575,12 +1761,45 @@ class OSPFv3Controller(app_manager.RyuApp):
                                     prefix["prefix"],
                                     prefix["prefix_length"],                                        
                                     prefix["prefix_options"]
-                                )
-                            
+                                )                          
 
+                        elif lsa["ls_type"] == 0x2009:
+                            prefix_lsa = lsa["intra_area_prefix_lsa"]
+
+                            self.logger.info(
+                                "    Intra-Area-Prefix-LSA body: "
+                                "referenced_type=0x%04x (%s) "
+                                "referenced_lsid=%s "
+                                "referenced_router=%s "
+                                "prefixes=%d",
+                                prefix_lsa["referenced_ls_type"],
+                                ospfv3_lsa_type_description(
+                                    prefix_lsa["referenced_ls_type"]
+                                ),
+                                prefix_lsa["referenced_link_state_id"],
+                                prefix_lsa["referenced_advertising_router"],
+                                prefix_lsa["number_of_prefixes"]
+                            )
+
+                            for prefix_index, prefix in enumerate(
+                                prefix_lsa["prefixes"],
+                                start=1
+                            ):
+                                self.logger.info(
+                                    "      Prefix #%d: "
+                                    "%s/%d "
+                                    "metric=%d "
+                                    "options=0x%02x",
+                                    prefix_index,
+                                    prefix["prefix"],
+                                    prefix["prefix_length"],
+                                    prefix["metric"],
+                                    prefix["prefix_options"]
+                                )
                     self.logger.info(
                         "---------------------------------------------"
                     )
 
                     if lsu_lsa_headers:
+                        self.update_lsa_request_list(lsu_lsa_headers)
                         self.send_ls_ack(lsu_lsa_headers)
