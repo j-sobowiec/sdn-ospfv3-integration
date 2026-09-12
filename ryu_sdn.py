@@ -551,6 +551,100 @@ def parse_ospfv3_router_lsa(raw_lsa):
         "links": links,
     }
 
+def parse_ospfv3_link_lsa(raw_lsa):
+    if len(raw_lsa) < 44:
+        raise ValueError(
+            f"Link-LSA jest za krotkie: {len(raw_lsa)} B"
+        )
+
+    router_priority = raw_lsa[20]
+
+    options = int.from_bytes(
+        raw_lsa[21:24],
+        byteorder="big"
+    )
+
+    link_local_address = socket.inet_ntop(
+        socket.AF_INET6,
+        raw_lsa[24:40]
+    )
+
+    number_of_prefixes = struct.unpack(
+        "!I",
+        raw_lsa[40:44]
+    )[0]
+
+    prefixes = []
+
+    # Prefiksy zaczynaja sie po:
+    # 20 B LSA header
+    # 24 B stalej czesci Link-LSA
+    offset = 44
+
+    for index in range(number_of_prefixes):
+
+        # Kazdy wpis prefiksu ma najpierw 4 B:
+        # PrefixLength + PrefixOptions + Reserved
+        if offset + 4 > len(raw_lsa):
+            raise ValueError(
+                f"Link-LSA: za malo danych na prefix #{index + 1}"
+            )
+
+        prefix_length = raw_lsa[offset]
+        prefix_options = raw_lsa[offset + 1]
+
+        reserved = struct.unpack(
+            "!H",
+            raw_lsa[offset + 2:offset + 4]
+        )[0]
+
+        if prefix_length > 128:
+            raise ValueError(
+                f"Link-LSA: niepoprawny prefix length: {prefix_length}"
+            )
+
+        # Adres prefiksu jest zapisany w wielokrotnosci 32 bitow.
+        prefix_bytes_length = (
+            (prefix_length + 31) // 32
+        ) * 4
+
+        prefix_start = offset + 4
+        prefix_end = prefix_start + prefix_bytes_length
+
+        if prefix_end > len(raw_lsa):
+            raise ValueError(
+                f"Link-LSA: prefix #{index + 1} wychodzi poza LSA"
+            )
+
+        prefix_bytes = bytes(
+            raw_lsa[prefix_start:prefix_end]
+        )
+
+        # Uzupelniamy zerami do pelnego adresu IPv6.
+        full_ipv6 = prefix_bytes.ljust(16, b"\x00")
+
+        prefix_address = socket.inet_ntop(
+            socket.AF_INET6,
+            full_ipv6
+        )
+
+        prefixes.append({
+            "prefix_length": prefix_length,
+            "prefix_options": prefix_options,
+            "reserved": reserved,
+            "prefix": prefix_address,
+        })
+
+        offset = prefix_end
+
+    return {
+        "router_priority": router_priority,
+        "options": options,
+        "link_local_address": link_local_address,
+        "number_of_prefixes": number_of_prefixes,
+        "prefixes": prefixes,
+    }
+
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -1361,12 +1455,22 @@ class OSPFv3Controller(app_manager.RyuApp):
                                     exc
                                 )
                                 return
-    
+                            
+                        elif ls_type == 0x0008:
+                            try:
+                                lsa_header["link_lsa"] = (
+                                    parse_ospfv3_link_lsa(raw_lsa)
+                                )
+                            except ValueError as exc:
+                                self.logger.warning(
+                                    "LSU: blad parsowania Link-LSA #%d: %s",
+                                    index + 1,
+                                    exc
+                                )
+                                return
+                            
                         lsu_lsa_headers.append(lsa_header)
 
-                        # UWAGA:
-                        # przechodzimy o CALA dlugosc LSA,
-                        # a nie o 20 bajtow.
                         offset += ls_length
 
                     self.logger.info(
@@ -1423,7 +1527,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 router_lsa["options"],
                                 len(router_lsa["links"])
                             )
-
+    
                             for link_index, link in enumerate(
                                 router_lsa["links"],
                                 start=1
@@ -1443,6 +1547,36 @@ class OSPFv3Controller(app_manager.RyuApp):
                                     link["neighbor_interface_id"],
                                     link["neighbor_router_id"]
                                 )
+
+                        elif lsa["ls_type"] == 0x0008:
+                            link_lsa = lsa["link_lsa"]
+
+                            self.logger.info(
+                                "    Link-LSA body: "
+                                "priority=%d "
+                                "options=0x%06x "
+                                "link_local=%s "
+                                "prefixes=%d",
+                                link_lsa["router_priority"],
+                                link_lsa["options"],
+                                link_lsa["link_local_address"],
+                                link_lsa["number_of_prefixes"]
+                            )
+
+                            for prefix_index, prefix in enumerate(
+                                link_lsa["prefixes"],
+                                start=1
+                            ):
+                                self.logger.info(
+                                    "      Prefix #%d: "
+                                    "%s/%d "
+                                    "options=0x%02x",
+                                    prefix_index,
+                                    prefix["prefix"],
+                                    prefix["prefix_length"],                                        
+                                    prefix["prefix_options"]
+                                )
+                            
 
                     self.logger.info(
                         "---------------------------------------------"
