@@ -857,6 +857,8 @@ class OSPFv3Controller(app_manager.RyuApp):
         
         self.lsdb_aging_thread = hub.spawn(self.lsdb_aging_loop)
 
+        self.topology_convergence_logged = False
+
     def send_ospfv3_hello(self):
         if self.datapath is None or self.ospf_port is None:
             return
@@ -1165,7 +1167,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                 )
 
                 continue
-
+            
             current_for_comparison = dict(current)
 
             current_for_comparison["ls_age"] = (
@@ -1202,6 +1204,13 @@ class OSPFv3Controller(app_manager.RyuApp):
             # comparison < 0:
             # starsza instancja - rowniez nic nie robimy.
 
+        if (
+            not self.topology_convergence_logged
+            and self.is_router_topology_converged()
+        ):
+            self.log_router_graph()
+            self.topology_convergence_logged = True
+            
     def install_lsa_in_lsdb(self, lsa):
         entry = dict(lsa)
 
@@ -1246,19 +1255,23 @@ class OSPFv3Controller(app_manager.RyuApp):
 
             self.logger.info(
                 "[OSPF][LSDB] removed expired %s "
-                "adv=%s lsid=%s age=%ds",
+                "adv=%s lsid=%s age=%ds remaining=%d",
                 ospfv3_lsa_type_description(
                     lsa["ls_type"]
                 ),
                 lsa["advertising_router"],
                 lsa["link_state_id"],
-                OSPF_MAX_AGE
+                OSPF_MAX_AGE,
+                len(self.lsdb)
             )
 
     def lsdb_aging_loop(self):
+        self.logger.info(
+            "[OSPF][LSDB] aging loop started"
+        )
+
         while True:
             hub.sleep(5)
-
             if self.lsdb:
                 self.purge_expired_lsas()
 
@@ -1325,6 +1338,89 @@ class OSPFv3Controller(app_manager.RyuApp):
                 lsa["ls_sequence"],
                 current_age
             )
+
+    def build_router_graph(self):
+        """
+        Builds the router-level topology graph from Router-LSAs
+        currently stored in the LSDB.
+        """
+
+        graph = {}
+
+        for lsa in self.lsdb.values():
+
+            # We only need Router-LSAs here.
+            if lsa["ls_type"] != 0x2001:
+                continue
+
+            router_lsa = lsa.get("router_lsa")
+
+            if router_lsa is None:
+                continue
+
+            router_id = lsa["advertising_router"]
+
+            if router_id not in graph:
+                graph[router_id] = []
+
+            for link in router_lsa["links"]:
+
+                # For now we only use point-to-point links.
+                if link["type"] != 1:
+                    continue
+
+                neighbor_router_id = link["neighbor_router_id"]
+
+                graph[router_id].append({
+                    "neighbor": neighbor_router_id,
+                    "cost": link["metric"],
+                    "interface_id": link["interface_id"],
+                    "neighbor_interface_id": (
+                        link["neighbor_interface_id"]
+                    )
+                })
+
+                # Ensure the neighbor also exists as a graph node,
+                # even if we do not have its Router-LSA yet.
+                if neighbor_router_id not in graph:
+                    graph[neighbor_router_id] = []
+
+        return graph
+
+    def is_router_topology_converged(self):
+        expected_links = {
+            "1.1.1.1": 3,
+            "2.2.2.2": 2,
+            "3.3.3.3": 2,
+        }
+
+        for router_id, expected_count in expected_links.items():
+            key = (
+                0x2001,
+                "0.0.0.0",
+                router_id
+            )
+
+            lsa = self.lsdb.get(key)
+
+            if lsa is None:
+                return False
+
+            router_lsa = lsa.get("router_lsa")
+
+            if router_lsa is None:
+                return False
+
+            p2p_links = [
+                link
+                for link in router_lsa["links"]
+                if link["type"] == 1
+            ]
+
+            if len(p2p_links) != expected_count:
+                return False
+
+        return True
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -1568,6 +1664,40 @@ class OSPFv3Controller(app_manager.RyuApp):
                         prefix["prefix_length"],
                         prefix["metric"]
                     )
+
+    def log_router_graph(self):
+        graph = self.build_router_graph()
+
+        self.logger.info(
+            "\n[OSPF][TOPOLOGY] router graph nodes=%d",
+            len(graph)
+        )
+
+        for router_id in sorted(graph.keys()):
+            links = graph[router_id]
+
+            if not links:
+                self.logger.info(
+                    "  router=%s links=0",
+                    router_id
+                )
+                continue
+
+            self.logger.info(
+                "  router=%s links=%d",
+                router_id,
+                len(links)
+            )
+
+            for link in links:
+                self.logger.info(
+                    "    -> %s cost=%d "
+                    "if=%s neighbor_if=%s",
+                    link["neighbor"],
+                    link["cost"],
+                    link["interface_id"],
+                    link["neighbor_interface_id"]
+                )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
