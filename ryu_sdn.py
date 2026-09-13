@@ -839,6 +839,8 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.ospf_port = None
         self.ospf_neighbors = []
 
+        self.hello_thread = hub.spawn(self.hello_loop)
+
         self.dbd_sequence = int(
             time.time() * 1000
         ) & 0xffffffff
@@ -851,7 +853,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.ospf_neighbor_mac = None
         self.lsr_sent = False
 
-        self.hello_thread = hub.spawn(self.hello_loop)
+        self.lsdb = {}
 
     def send_ospfv3_hello(self):
         if self.datapath is None or self.ospf_port is None:
@@ -1098,6 +1100,104 @@ class OSPFv3Controller(app_manager.RyuApp):
             self.logger.info(
                 "[OSPF][LSR] request-list complete"
             )
+
+    def update_lsdb(self, received_lsa_headers):
+        """
+        Installs new LSAs in the local LSDB and replaces
+        existing entries only when a newer instance is received.
+        """
+
+        for received in received_lsa_headers:
+            key = (
+                received["ls_type"],
+                received["link_state_id"],
+                received["advertising_router"]
+            )
+
+            current = self.lsdb.get(key)
+
+            # LSA nie istnieje jeszcze w LSDB.
+            if current is None:
+                self.lsdb[key] = self.install_lsa_in_lsdb(received)
+
+                self.logger.info(
+                    "[OSPF][LSDB] installed %s "
+                    "adv=%s lsid=%s seq=0x%08x",
+                    ospfv3_lsa_type_description(
+                        received["ls_type"]
+                    ),
+                    received["advertising_router"],
+                    received["link_state_id"],
+                    received["ls_sequence"]
+                )
+
+                continue
+
+            current_for_comparison = dict(current)
+
+            current_for_comparison["ls_age"] = (
+                self.get_lsdb_lsa_age(current)
+            )
+
+            comparison = compare_lsa_instances(
+                received,
+                current_for_comparison
+            )
+
+            # Otrzymalismy nowsza instancje tego samego LSA.
+            if comparison > 0:
+                old_sequence = current["ls_sequence"]
+
+                self.lsdb[key] = self.install_lsa_in_lsdb(received)
+
+                self.logger.info(
+                    "[OSPF][LSDB] updated %s "
+                    "adv=%s lsid=%s "
+                    "seq=0x%08x -> 0x%08x",
+                    ospfv3_lsa_type_description(
+                        received["ls_type"]
+                    ),
+                    received["advertising_router"],
+                    received["link_state_id"],
+                    old_sequence,
+                    received["ls_sequence"]
+                )
+
+            # comparison == 0:
+            # identyczna instancja - nic nie robimy.
+            #
+            # comparison < 0:
+            # starsza instancja - rowniez nic nie robimy.
+
+    def install_lsa_in_lsdb(self, lsa):
+        entry = dict(lsa)
+
+        entry["_age_base"] = lsa["ls_age"]
+        entry["_age_timestamp"] = time.monotonic()
+
+        return entry
+
+    def get_lsdb_lsa_age(self, lsa):
+        base_age = lsa.get(
+            "_age_base",
+            lsa["ls_age"]
+        )
+
+        timestamp = lsa.get(
+            "_age_timestamp"
+        )
+
+        if timestamp is None:
+            return base_age
+
+        elapsed = int(
+            time.monotonic() - timestamp
+        )
+
+        return min(
+            OSPF_MAX_AGE,
+            base_age + elapsed
+        )
 
     def send_ls_ack(self, lsa_headers):
         if self.datapath is None or self.ospf_port is None:
@@ -1826,4 +1926,5 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                     if lsu_lsa_headers:
                         self.update_lsa_request_list(lsu_lsa_headers)
+                        self.update_lsdb(lsu_lsa_headers)
                         self.send_ls_ack(lsu_lsa_headers)
