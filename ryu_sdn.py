@@ -839,8 +839,6 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.ospf_port = None
         self.ospf_neighbors = []
 
-        self.hello_thread = hub.spawn(self.hello_loop)
-
         self.dbd_sequence = int(
             time.time() * 1000
         ) & 0xffffffff
@@ -854,6 +852,10 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.lsr_sent = False
 
         self.lsdb = {}
+
+        self.hello_thread = hub.spawn(self.hello_loop)
+        
+        self.lsdb_aging_thread = hub.spawn(self.lsdb_aging_loop)
 
     def send_ospfv3_hello(self):
         if self.datapath is None or self.ospf_port is None:
@@ -1116,6 +1118,37 @@ class OSPFv3Controller(app_manager.RyuApp):
 
             current = self.lsdb.get(key)
 
+            current_for_comparison = None
+
+            if current is not None:
+                current_for_comparison = dict(current)
+
+                current_for_comparison["ls_age"] = (
+                    self.get_lsdb_lsa_age(current)
+                )
+
+            if received["ls_age"] >= OSPF_MAX_AGE:
+                if current_for_comparison is not None:
+                    comparison = compare_lsa_instances(
+                        received,
+                        current_for_comparison
+                    )
+
+                    if comparison >= 0:
+                        del self.lsdb[key]
+
+                        self.logger.info(
+                            "[OSPF][LSDB] flushed %s "
+                            "adv=%s lsid=%s",
+                            ospfv3_lsa_type_description(
+                                received["ls_type"]
+                            ),
+                            received["advertising_router"],
+                            received["link_state_id"]
+                        )
+
+                continue
+
             # LSA nie istnieje jeszcze w LSDB.
             if current is None:
                 self.lsdb[key] = self.install_lsa_in_lsdb(received)
@@ -1198,6 +1231,36 @@ class OSPFv3Controller(app_manager.RyuApp):
             OSPF_MAX_AGE,
             base_age + elapsed
         )
+
+    def purge_expired_lsas(self):
+        expired_keys = []
+
+        for key, lsa in self.lsdb.items():
+            current_age = self.get_lsdb_lsa_age(lsa)
+
+            if current_age >= OSPF_MAX_AGE:
+                expired_keys.append(key)
+
+        for key in expired_keys:
+            lsa = self.lsdb.pop(key)
+
+            self.logger.info(
+                "[OSPF][LSDB] removed expired %s "
+                "adv=%s lsid=%s age=%ds",
+                ospfv3_lsa_type_description(
+                    lsa["ls_type"]
+                ),
+                lsa["advertising_router"],
+                lsa["link_state_id"],
+                OSPF_MAX_AGE
+            )
+
+    def lsdb_aging_loop(self):
+        while True:
+            hub.sleep(5)
+
+            if self.lsdb:
+                self.purge_expired_lsas()
 
     def send_ls_ack(self, lsa_headers):
         if self.datapath is None or self.ospf_port is None:
@@ -1634,9 +1697,6 @@ class OSPFv3Controller(app_manager.RyuApp):
                         neighbors
                     )
 
-                    if self.lsdb:
-                        self.log_lsdb_snapshot()
-                        
                 elif version == 3 and pkt_type == 2 and pkt_len >= 28:
                     dbd_data = ospf_data[16:28]
 
