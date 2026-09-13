@@ -121,11 +121,11 @@ def start_frr(router):
     sockets = router.cmd("ls /run/frr/*.vty 2>/dev/null")
     if "zebra.vty" not in sockets or "ospf6d.vty" not in sockets:
         info(
-            f"*** OSTRZEŻENIE: brak gniazd VTY na {router.name}:\n"
+            f"*** WARNING: no VTY sockets on {router.name}:\n"
             f"{sockets}\n"
         )
 
-    info(f"*** {router.name}: zakończono start FRR\n")
+    info(f"*** {router.name}: finished starting FRR\n")
 
 
 def main():
@@ -139,7 +139,7 @@ def main():
         port=6653
         )
 
-        info("*** Dodawanie routerów FRR\n")
+        info("*** Adding FRR routers\n")
         docker_params = dict(
             ip=None,
             dimage=FRR_IMAGE,
@@ -157,7 +157,7 @@ def main():
         r2 = net.addDocker("r2", **docker_params)
         r3 = net.addDocker("r3", **docker_params)
 
-        info("*** Dodawanie OVS i hosta\n")
+        info("*** Adding OVS and host\n")
 
         s1 = net.addSwitch(
         "s1",
@@ -169,16 +169,16 @@ def main():
 
         h1 = net.addHost("h1", ip=None)
 
-        info("*** Tworzenie pełnego trójkąta routerów\n")
+        info("*** Creating full triangle of routers\n")
         net.addLink(r1, r2, intfName1="r1-eth0", intfName2="r2-eth0")
         net.addLink(r2, r3, intfName1="r2-eth1", intfName2="r3-eth0")
         net.addLink(r3, r1, intfName1="r3-eth1", intfName2="r1-eth1")
 
-        info("*** Podłączanie R1 do s1 i h1\n")
+        info("*** Connecting R1 to s1 and h1\n")
         net.addLink(r1, s1, intfName1="r1-eth2")
         net.addLink(s1, h1)
 
-        info("*** Konfiguracja IPv6 i OSPFv3\n")
+        info("*** IPv6 and OSPFv3 configuration\n")
         configure_router(
             r1,
             {
@@ -218,10 +218,10 @@ def main():
         )
 
     
-        info("*** Start sieci i demonów zebra/ospf6d\n")
+        info("*** Starting routers and daemons\n")
         net.start()
 
-        info("*** Kontroler s1:\n")
+        info("*** Controler s1:\n")
         info(s1.cmd("ovs-vsctl get-controller s1"))
 
         info("*** OpenFlow flows:\n")
@@ -230,13 +230,13 @@ def main():
         for router in (r1, r2, r3):
             start_frr(router)
 
-        info("\n*** Przykładowe polecenia w CLI:\n")
+        info("\n*** Example commands in CLI:\n")
         info("r1 vtysh -c 'show ipv6 ospf6 neighbor'\n")
         info("r2 vtysh -c 'show ipv6 route ospf6'\n")
         info("h1 ping -6 -c 3 2001:db8:23::3\n\n")
         CLI(net)
     finally:
-        info("*** Zatrzymywanie sieci\n")
+        info("*** Stopping network\n")
         net.stop()
 
 

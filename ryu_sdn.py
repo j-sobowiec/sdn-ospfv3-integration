@@ -465,7 +465,7 @@ def parse_ospfv3_router_lsa(raw_lsa):
 
     if len(raw_lsa) < 24:
         raise ValueError(
-            f"Router-LSA jest za krotkie: {len(raw_lsa)} B"
+            f"Router-LSA is too short: {len(raw_lsa)} B"
         )
 
     # Pole Length znajduje sie w ostatnich 2 bajtach
@@ -478,7 +478,7 @@ def parse_ospfv3_router_lsa(raw_lsa):
     if ls_length != len(raw_lsa):
         raise ValueError(
             f"Router-LSA: LS Length={ls_length}, "
-            f"rzeczywista dlugosc={len(raw_lsa)}"
+            f"actual length={len(raw_lsa)}"
         )
 
     # Pierwszy bajt body = flagi routera.
@@ -495,8 +495,8 @@ def parse_ospfv3_router_lsa(raw_lsa):
     # Kazdy opis linku Router-LSA ma dokladnie 16 B.
     if link_data_length % 16 != 0:
         raise ValueError(
-            "Router-LSA: czesc z opisami linkow "
-            f"ma niepoprawna dlugosc {link_data_length} B"
+            "Router-LSA: link description section "
+            f"has invalid length {link_data_length} B"
         )
 
     links = []
@@ -556,7 +556,7 @@ def parse_ospfv3_router_lsa(raw_lsa):
 def parse_ospfv3_link_lsa(raw_lsa):
     if len(raw_lsa) < 44:
         raise ValueError(
-            f"Link-LSA jest za krotkie: {len(raw_lsa)} B"
+            f"Link-LSA is too short: {len(raw_lsa)} B"
         )
 
     router_priority = raw_lsa[20]
@@ -589,7 +589,7 @@ def parse_ospfv3_link_lsa(raw_lsa):
         # PrefixLength + PrefixOptions + Reserved
         if offset + 4 > len(raw_lsa):
             raise ValueError(
-                f"Link-LSA: za malo danych na prefix #{index + 1}"
+                f"Link-LSA: insufficient data for prefix #{index + 1}"
             )
 
         prefix_length = raw_lsa[offset]
@@ -602,7 +602,7 @@ def parse_ospfv3_link_lsa(raw_lsa):
 
         if prefix_length > 128:
             raise ValueError(
-                f"Link-LSA: niepoprawny prefix length: {prefix_length}"
+                f"Link-LSA: invalid prefix length: {prefix_length}"
             )
 
         # Adres prefiksu jest zapisany w wielokrotnosci 32 bitow.
@@ -615,7 +615,7 @@ def parse_ospfv3_link_lsa(raw_lsa):
 
         if prefix_end > len(raw_lsa):
             raise ValueError(
-                f"Link-LSA: prefix #{index + 1} wychodzi poza LSA"
+                f"Link-LSA: prefix #{index + 1} exceeds LSA boundary"
             )
 
         prefix_bytes = bytes(
@@ -650,7 +650,7 @@ def parse_ospfv3_link_lsa(raw_lsa):
 def parse_ospfv3_intra_area_prefix_lsa(raw_lsa):
     if len(raw_lsa) < 32:
         raise ValueError(
-            f"Intra-Area-Prefix-LSA jest za krotkie: {len(raw_lsa)} B"
+            f"Intra-Area-Prefix-LSA is too short: {len(raw_lsa)} B"
         )
 
     # Stala czesc body zaczyna sie po 20-bajtowym LSA header.
@@ -681,7 +681,7 @@ def parse_ospfv3_intra_area_prefix_lsa(raw_lsa):
         if offset + 4 > len(raw_lsa):
             raise ValueError(
                 f"Intra-Area-Prefix-LSA: "
-                f"za malo danych na prefix #{index + 1}"
+                f"insufficient data for prefix #{index + 1}"
             )
 
         prefix_length = raw_lsa[offset]
@@ -695,7 +695,7 @@ def parse_ospfv3_intra_area_prefix_lsa(raw_lsa):
         if prefix_length > 128:
             raise ValueError(
                 f"Intra-Area-Prefix-LSA: "
-                f"niepoprawny prefix length {prefix_length}"
+                f"invalid prefix length {prefix_length}"
             )
 
         # Prefix jest kodowany w wielokrotnosci 32 bitow.
@@ -709,7 +709,7 @@ def parse_ospfv3_intra_area_prefix_lsa(raw_lsa):
         if prefix_end > len(raw_lsa):
             raise ValueError(
                 f"Intra-Area-Prefix-LSA: "
-                f"prefix #{index + 1} wychodzi poza LSA"
+                f"prefix #{index + 1} exceeds LSA boundary"
             )
 
         prefix_bytes = bytes(
@@ -880,7 +880,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         datapath.send_msg(packet_out)
 
         self.logger.info(
-            "Wyslano Hello: port=%s neighbors=%s",
+            "[OSPF][HELLO TX] port=%s neighbors=%s",
             self.ospf_port,
             self.ospf_neighbors
         )
@@ -922,8 +922,8 @@ class OSPFv3Controller(app_manager.RyuApp):
         datapath.send_msg(packet_out)
 
         self.logger.info(
-            "Wyslano initial DBD: "
-            "I=1 M=1 MS=1 seq=0x%08x",
+            "[OSPF][DBD TX] initial "
+            "seq=0x%08x flags=I,M,MS",
             self.dbd_sequence
         )
 
@@ -955,8 +955,8 @@ class OSPFv3Controller(app_manager.RyuApp):
         datapath.send_msg(packet_out)
 
         self.logger.info(
-            "Wyslano Exchange DBD: "
-            "I=0 M=0 MS=1 seq=0x%08x",
+            "[OSPF][DBD TX] exchange "
+            "seq=0x%08x flags=MS",
             self.dbd_sequence
         )
 
@@ -1028,9 +1028,9 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.lsr_sent = True
 
         self.logger.info(
-            "Wyslano OSPFv3 LSR: %d LSA do %s",
-            len(self.lsa_request_list),
-            self.ospf_neighbor_ipv6
+            "[OSPF][LSR TX] to=%s count=%d",
+            self.ospf_neighbor_ipv6,
+            len(self.lsa_request_list)
         )
 
         for index, lsa in enumerate(
@@ -1038,15 +1038,12 @@ class OSPFv3Controller(app_manager.RyuApp):
             start=1
         ):
             self.logger.info(
-                "  Request #%d: "
-                "type=0x%04x (%s) "
-                "link_state_id=%s "
-                "adv_router=%s",
-                index,
-                lsa["ls_type"],
-                ospfv3_lsa_type_description(lsa["ls_type"]),
-                lsa["link_state_id"],
-                lsa["advertising_router"]
+                "  -> %s adv=%s lsid=%s",
+                ospfv3_lsa_type_description(
+                    lsa["ls_type"]
+                ),
+                lsa["advertising_router"],
+                lsa["link_state_id"]
             )
 
     def update_lsa_request_list(self, received_lsa_headers):
@@ -1092,14 +1089,14 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         if new_count != old_count:
             self.logger.info(
-                "LSR: odebrano %d oczekiwanych LSA, pozostalo %d",
+                "[OSPF][LSR] received=%d pending=%d",
                 old_count - new_count,
                 new_count
             )
 
         if old_count > 0 and new_count == 0:
             self.logger.info(
-                "LSR: wszystkie zadane LSA zostaly odebrane"
+                "[OSPF][LSR] request-list complete"
             )
 
     def send_ls_ack(self, lsa_headers):
@@ -1178,7 +1175,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         datapath.send_msg(flow_mod)
 
         self.logger.info(
-            "Polaczono switch DPID=%016x",
+            "Connected switch DPID=%016x",
             datapath.id
         )
 
@@ -1186,6 +1183,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self,
         in_port,
         ipv6_pkt,
+        pkt_len,
         router_id_text,
         area_id_text,
         interface_id,
@@ -1195,32 +1193,27 @@ class OSPFv3Controller(app_manager.RyuApp):
         dead_interval,
         neighbors
     ):
-        if neighbors:
-            neighbors_text = ", ".join(neighbors)
-        else:
-            neighbors_text = "-"
+        neighbors_text = ", ".join(neighbors) if neighbors else "-"
 
         self.logger.info(
             "\n[OSPF][HELLO RX] "
-            "router=%s src=%s port=%s area=%s",
+            "router=%s src=%s port=%s area=%s len=%d",
             router_id_text,
             ipv6_pkt.src,
             in_port,
-            area_id_text
+            area_id_text,
+            pkt_len
         )
 
         self.logger.info(
             "  ifid=%s priority=%d "
-            "hello=%ds dead=%ds options=0x%06x",
+            "hello=%ds dead=%ds "
+            "options=0x%06x neighbors=%s",
             interface_id,
             priority,
             hello_interval,
             dead_interval,
-            options
-        )
-
-        self.logger.info(
-            "  neighbors=%s",
+            options,
             neighbors_text
         )
 
@@ -1272,8 +1265,7 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         for lsa in lsa_headers:
             self.logger.info(
-                "    -> %s "
-                "adv=%s lsid=%s seq=0x%08x",
+                "    -> %s adv=%s lsid=%s seq=0x%08x",
                 ospfv3_lsa_type_description(
                     lsa["ls_type"]
                 ),
@@ -1436,7 +1428,7 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                 if checksum != calculated_checksum:
                     self.logger.warning(
-                        "OSPFv3: niepoprawny checksum "
+                        "[OSPF][WARN] invalid checksum "
                         "received=0x%04x calculated=0x%04x",
                         checksum,
                         calculated_checksum
@@ -1471,6 +1463,13 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                     neighbor_data = ospf_data[36:pkt_len]
 
+                    if len(neighbor_data) % 4 != 0:
+                        self.logger.warning(
+                            "[OSPF][HELLO] invalid neighbor-list length=%d",
+                            len(neighbor_data)
+                        )
+                        return
+
                     for offset in range(0, len(neighbor_data), 4):
                         if offset + 4 <= len(neighbor_data):
                             neighbor_id = struct.unpack(
@@ -1484,81 +1483,35 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 )
                             )
 
-                    if checksum == calculated_checksum:
-                        neighbor_router_id = socket.inet_ntoa(
-                            struct.pack("!I", router_id)
-                        )
 
-                        self.ospf_port = in_port
-                        self.ospf_neighbor_ipv6 = ipv6_pkt.src
-                        self.ospf_neighbor_mac = eth_pkt.src
+                    self.ospf_port = in_port
+                    self.ospf_neighbor_ipv6 = ipv6_pkt.src
+                    self.ospf_neighbor_mac = eth_pkt.src
 
-                        if neighbor_router_id not in self.ospf_neighbors:
-
-                            self.ospf_neighbors.append(
-                                neighbor_router_id
-                            )
-
-                            self.logger.info(
-                                "Dodano sasiada OSPFv3: %s",
-                                neighbor_router_id
-                            )
-
-                            self.send_ospfv3_hello()
+                    if router_id_text not in self.ospf_neighbors:
+                        self.ospf_neighbors.append(router_id_text)
 
                         self.logger.info(
-                            "\n"
-                            "---------------- OSPFv3 HELLO ----------------\n"
-                            "port=%s\n"
-                            "src=%s\n"
-                            "dst=%s\n"
-                            "Ethernet:\n"
-                            "  src=%s\n"
-                            "  dst=%s\n"
-                            "Checksum:\n"
-                            "  received=0x%04x\n"
-                            "  calculated=0x%04x\n"
-                            "  valid=%s\n"
-                            "Header:\n"
-                            "  version=%s\n"
-                            "  type=%s\n"
-                            "  length=%s\n"
-                            "  router_id=%s\n"
-                            "  area_id=%s\n"
-                            "  instance_id=%s\n"
-                            "Hello:\n"
-                            "  interface_id=%s\n"
-                            "  priority=%s\n"
-                            "  options=0x%06x\n"
-                            "  hello_interval=%s\n"
-                            "  dead_interval=%s\n"
-                            "  neighbors=%s\n"
-                            "---------------------------------------------",
-                            in_port,
-                            ipv6_pkt.src,
-                            ipv6_pkt.dst,
-                            eth_pkt.src,
-                            eth_pkt.dst,
-                            checksum,
-                            calculated_checksum,
-                            checksum == calculated_checksum,
-                            version,
-                            pkt_type,
-                            pkt_len,
-                            socket.inet_ntoa(
-                                struct.pack("!I", router_id)
-                            ),
-                            socket.inet_ntoa(
-                                struct.pack("!I", area_id)
-                            ),
-                            instance_id,
-                            interface_id,
-                            router_priority,
-                            options,
-                            hello_interval,
-                            dead_interval,
-                            neighbors if neighbors else "brak"
+                            "[OSPF][NEIGHBOR] discovered router=%s src=%s",
+                            router_id_text,
+                            ipv6_pkt.src
                         )
+
+                        self.send_ospfv3_hello()
+
+                    self.log_hello(
+                        in_port,
+                        ipv6_pkt,
+                        pkt_len,
+                        router_id_text,
+                        area_id_text,
+                        interface_id,
+                        router_priority,
+                        options,
+                        hello_interval,
+                        dead_interval,
+                        neighbors
+                    )
 
                 elif version == 3 and pkt_type == 2 and pkt_len >= 28:
                     dbd_data = ospf_data[16:28]
@@ -1588,10 +1541,14 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                     lsa_data = ospf_data[28:pkt_len]
 
-                    for offset in range(0, len(lsa_data), 20):
-                        if offset + 20 > len(lsa_data):
-                            break
+                    if len(lsa_data) % 20 != 0:
+                        self.logger.warning(
+                            "[OSPF][DBD] invalid LSA-summary length=%d",
+                            len(lsa_data)
+                        )
+                        return
 
+                    for offset in range(0, len(lsa_data), 20):
                         (
                             ls_age,
                             ls_type,
@@ -1621,86 +1578,21 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                         lsa_headers.append(lsa_header)
 
-                    self.logger.info(
-                        "\n"
-                        "---------------- OSPFv3 DBD ----------------\n"
-                        "port=%s\n"
-                        "src=%s\n"
-                        "dst=%s\n"
-                        "Ethernet:\n"
-                        "  src=%s\n"
-                        "  dst=%s\n"
-                        "Checksum:\n"
-                        "  received=0x%04x\n"
-                        "  calculated=0x%04x\n"
-                        "  valid=%s\n"
-                        "Header:\n"
-                        "  version=%s\n"
-                        "  type=%s\n"
-                        "  length=%s\n"
-                        "  router_id=%s\n"
-                        "  area_id=%s\n"
-                        "  instance_id=%s\n"
-                        "DBD:\n"
-                        "  interface_mtu=%s\n"
-                        "  options=0x%06x\n"
-                        "  flags=0x%02x\n"
-                        "  I=%s\n"
-                        "  M=%s\n"
-                        "  MS=%s\n"
-                        "  dd_sequence=0x%08x\n"
-                        "---------------------------------------------",
+                    # UWAGA:
+                    # logowanie dopiero PO sparsowaniu wszystkich naglowkow LSA
+                    self.log_dbd(
                         in_port,
-                        ipv6_pkt.src,
-                        ipv6_pkt.dst,
-                        eth_pkt.src,
-                        eth_pkt.dst,
-                        checksum,
-                        calculated_checksum,
-                        checksum == calculated_checksum,
-                        version,
-                        pkt_type,
-                        pkt_len,
-                        socket.inet_ntoa(
-                            struct.pack("!I", router_id)
-                        ),
-                        socket.inet_ntoa(
-                            struct.pack("!I", area_id)
-                        ),
-                        instance_id,
+                        ipv6_pkt,
+                        router_id_text,
+                        area_id_text,
                         interface_mtu,
                         options,
-                        flags,
                         i_bit,
                         m_bit,
                         ms_bit,
-                        dd_sequence
+                        dd_sequence,
+                        lsa_headers
                     )
-
-                    if lsa_headers:
-                        self.logger.info(
-                            "LSA headers w DBD: %s",
-                            len(lsa_headers)
-                        )
-
-                        for index, lsa in enumerate(lsa_headers, start=1):
-                            self.logger.info(
-                                "  LSA #%s: "
-                                "type=0x%04x (%s) "
-                                "link_state_id=%s "
-                                "adv_router=%s "
-                                "seq=0x%08x "
-                                "age=%s "
-                                "length=%s",
-                                index,
-                                lsa["ls_type"],
-                                ospfv3_lsa_type_description(lsa["ls_type"]),
-                                lsa["link_state_id"],
-                                lsa["advertising_router"],
-                                lsa["ls_sequence"],
-                                lsa["ls_age"],
-                                lsa["ls_length"]
-                            )
 
                     local_router_id = struct.unpack(
                         "!I",
@@ -1725,12 +1617,14 @@ class OSPFv3Controller(app_manager.RyuApp):
                             or self.dbd_exchange_complete
                         ):
                             self.reset_dbd_state(
-                                "sasiad rozpoczal ponownie ExStart"
+                                "neighbor restarted ExStart"
                             )
 
                         self.logger.info(
-                            "ExStart: Router ID Ryu jest wyzszy. "
-                            "Wysylam initial DBD."
+                            "[OSPF][DBD] ExStart "
+                            "local=%s peer=%s role=Master",
+                            OSPF_ROUTER_ID,
+                            router_id_text
                         )
 
                         self.send_initial_dbd()
@@ -1743,8 +1637,9 @@ class OSPFv3Controller(app_manager.RyuApp):
                         and local_router_id > router_id
                     ):
                         self.logger.info(
-                            "DBD: negocjacja Master/Slave zakonczona. "
-                            "Ryu jest Masterem."
+                            "[OSPF][DBD] negotiation-complete "
+                            "role=Master seq=0x%08x",
+                            dd_sequence
                         )
 
                         self.dbd_negotiated = True
@@ -1752,7 +1647,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                         self.lsa_request_list = list(lsa_headers)
 
                         self.logger.info(
-                            "DBD: zapisano %d LSA do Link State Request List.",
+                            "[OSPF][DBD] request-list=%d",
                             len(self.lsa_request_list)
                         )
 
@@ -1773,13 +1668,8 @@ class OSPFv3Controller(app_manager.RyuApp):
                         self.dbd_exchange_complete = True
 
                         self.logger.info(
-                            "DBD: Exchange zakonczony poprawnie. "
-                            "Otrzymano potwierdzenie seq=0x%08x",
-                            dd_sequence
-                        )
-
-                        self.logger.info(
-                            "LSA oczekujace na pobranie: %d",
+                            "[OSPF][DBD] exchange-complete seq=0x%08x pending=%d",
+                            dd_sequence,
                             len(self.lsa_request_list)
                         )
 
@@ -1808,7 +1698,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                         # Każde LSA musi mieć przynajmniej 20-bajtowy nagłówek.
                         if offset + 20 > pkt_len:
                             self.logger.warning(
-                                "LSU: za malo danych na naglowek LSA #%d",
+                                "[OSPF][LSU] insufficient data for LSA header #%d",
                                 index + 1
                             )
                             return
@@ -1833,7 +1723,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                         # Dlugosc LSA zawiera jego 20-bajtowy naglowek.
                         if ls_length < 20:
                             self.logger.warning(
-                                "LSU: niepoprawna dlugosc LSA #%d: %d",
+                                "[OSPF][LSU] invalid LSA length #%d: %d",
                                 index + 1,
                                 ls_length
                             )
@@ -1841,8 +1731,8 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                         if offset + ls_length > pkt_len:
                             self.logger.warning(
-                                "LSU: LSA #%d wychodzi poza pakiet "
-                                "(offset=%d length=%d pkt_len=%d)",
+                                "[OSPF][LSU] LSA #%d exceeds packet boundary "
+                                "(offset=%d length=%d packet=%d)",
                                 index + 1,
                                 offset,
                                 ls_length,
@@ -1878,7 +1768,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 )
                             except ValueError as exc:
                                 self.logger.warning(
-                                    "LSU: blad parsowania Router-LSA #%d: %s",
+                                    "[OSPF][LSU] Router-LSA parse error #%d: %s",
                                     index + 1,
                                     exc
                                 )
@@ -1891,7 +1781,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 )
                             except ValueError as exc:
                                 self.logger.warning(
-                                    "LSU: blad parsowania Link-LSA #%d: %s",
+                                    "[OSPF][LSU] Link-LSA parse error #%d: %s",
                                     index + 1,
                                     exc
                                 )
@@ -1906,8 +1796,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 )
                             except ValueError as exc:
                                 self.logger.warning(
-                                    "LSU: blad parsowania "
-                                    "Intra-Area-Prefix-LSA #%d: %s",
+                                    "[OSPF][LSU] Intra-Area-Prefix-LSA parse error #%d: %s",
                                     index + 1,
                                     exc
                                 )
@@ -1917,6 +1806,15 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                         offset += ls_length
 
+                    if offset != pkt_len:
+                        self.logger.warning(
+                            "[OSPF][LSU] length mismatch "
+                            "parsed=%d packet=%d",
+                            offset,
+                            pkt_len
+                        )
+                        return
+                        
                     self.log_lsu(
                         in_port,
                         ipv6_pkt,
