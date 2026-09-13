@@ -1216,27 +1216,6 @@ class OSPFv3Controller(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-    def log_lsdb_snapshot(self):
-        self.logger.info(
-            "\n[OSPF][LSDB] snapshot entries=%d",
-            len(self.lsdb)
-        )
-
-        for lsa in self.lsdb.values():
-            current_age = self.get_lsdb_lsa_age(lsa)
-
-            self.logger.info(
-                "  %s adv=%s lsid=%s "
-                "seq=0x%08x age=%ds",
-                ospfv3_lsa_type_description(
-                    lsa["ls_type"]
-                ),
-                lsa["advertising_router"],
-                lsa["link_state_id"],
-                lsa["ls_sequence"],
-                current_age
-            )
-
         frame = build_ospfv3_lsack_frame(
             lsa_headers,
             self.ospf_neighbor_ipv6,
@@ -1262,6 +1241,27 @@ class OSPFv3Controller(app_manager.RyuApp):
             self.ospf_neighbor_ipv6,
             len(lsa_headers)
         )
+
+    def log_lsdb_snapshot(self):
+        self.logger.info(
+            "\n[OSPF][LSDB] snapshot entries=%d",
+            len(self.lsdb)
+        )
+
+        for lsa in self.lsdb.values():
+            current_age = self.get_lsdb_lsa_age(lsa)
+
+            self.logger.info(
+                "  %s adv=%s lsid=%s "
+                "seq=0x%08x age=%ds",
+                ospfv3_lsa_type_description(
+                    lsa["ls_type"]
+                ),
+                lsa["advertising_router"],
+                lsa["link_state_id"],
+                lsa["ls_sequence"],
+                current_age
+            )
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -1636,7 +1636,7 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                     if self.lsdb:
                         self.log_lsdb_snapshot()
-
+                        
                 elif version == 3 and pkt_type == 2 and pkt_len >= 28:
                     dbd_data = ospf_data[16:28]
 
