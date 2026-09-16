@@ -1212,6 +1212,7 @@ class OSPFv3Controller(app_manager.RyuApp):
             self.log_router_graph()
             self.log_spf_result()
             self.log_prefix_advertisements()
+            self.log_ipv6_routing_table()
 
             self.topology_convergence_logged = True
             
@@ -1518,6 +1519,74 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         return advertisements
 
+    def build_ipv6_routing_table(self):
+        """
+        Builds the IPv6 routing table from SPF results
+        and Intra-Area-Prefix-LSA advertisements.
+        """
+
+        distances, previous = self.run_spf()
+        advertisements = self.collect_prefix_advertisements()
+
+        routes = {}
+
+        for advertisement in advertisements:
+            advertising_router = advertisement[
+                "advertising_router"
+            ]
+
+            if advertising_router not in distances:
+                continue
+
+            router_cost = distances[advertising_router]
+
+            if router_cost == float("inf"):
+                continue
+
+            prefix_metric = advertisement["metric"]
+
+            total_cost = router_cost + prefix_metric
+
+            next_hop = self.get_spf_next_hop(
+                advertising_router,
+                previous
+            )
+
+            prefix_key = (
+                advertisement["prefix"],
+                advertisement["prefix_length"]
+            )
+
+            candidate = {
+                "prefix": advertisement["prefix"],
+                "prefix_length": advertisement["prefix_length"],
+                "advertising_router": advertising_router,
+                "router_cost": router_cost,
+                "prefix_metric": prefix_metric,
+                "total_cost": total_cost,
+                "next_hop": next_hop
+            }
+
+            current = routes.get(prefix_key)
+
+            if current is None:
+                routes[prefix_key] = candidate
+                continue
+
+            # Lower total OSPF cost wins.
+            if candidate["total_cost"] < current["total_cost"]:
+                routes[prefix_key] = candidate
+
+            # Deterministic tie-break for equal-cost candidates.
+            elif (
+                candidate["total_cost"]
+                == current["total_cost"]
+                and candidate["advertising_router"]
+                < current["advertising_router"]
+            ):
+                routes[prefix_key] = candidate
+
+        return routes
     def is_router_topology_converged(self):
         expected_links = {
             "1.1.1.1": 3,
@@ -1897,6 +1966,27 @@ class OSPFv3Controller(app_manager.RyuApp):
                 entry["prefix_length"],
                 entry["advertising_router"],
                 entry["metric"]
+            )
+
+    def log_ipv6_routing_table(self):
+        routes = self.build_ipv6_routing_table()
+
+        self.logger.info(
+            "\n[OSPF][ROUTES] IPv6 routing table entries=%d",
+            len(routes)
+        )
+
+        for prefix_key in sorted(routes.keys()):
+            route = routes[prefix_key]
+
+            self.logger.info(
+                "  %s/%d cost=%d "
+                "adv=%s next-hop=%s",
+                route["prefix"],
+                route["prefix_length"],
+                route["total_cost"],
+                route["advertising_router"],
+                route["next_hop"]
             )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
