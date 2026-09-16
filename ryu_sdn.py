@@ -1385,6 +1385,24 @@ class OSPFv3Controller(app_manager.RyuApp):
                 if neighbor_router_id not in graph:
                     graph[neighbor_router_id] = []
 
+                if neighbor_router_id == OSPF_ROUTER_ID:
+
+                    reverse_exists = any(
+                        existing["neighbor"] == router_id
+                        for existing in graph[OSPF_ROUTER_ID]
+                    )
+
+                    if not reverse_exists:
+                        graph[OSPF_ROUTER_ID].append({
+                            "neighbor": router_id,
+                            "cost": link["metric"],
+                            "interface_id": (
+                                link["neighbor_interface_id"]
+                            ),
+                            "neighbor_interface_id": (
+                                link["interface_id"]
+                            )
+                        })
         return graph
 
     def is_router_topology_converged(self):
@@ -1673,7 +1691,16 @@ class OSPFv3Controller(app_manager.RyuApp):
             len(graph)
         )
 
-        for router_id in sorted(graph.keys()):
+        router_ids = sorted(
+            router_id
+            for router_id in graph.keys()
+            if router_id != OSPF_ROUTER_ID
+        )
+
+        if OSPF_ROUTER_ID in graph:
+            router_ids.append(OSPF_ROUTER_ID)
+
+        for router_id in router_ids:
             links = graph[router_id]
 
             if not links:
