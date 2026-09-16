@@ -10,6 +10,7 @@ import socket
 from ryu.lib.packet import ethernet
 from ryu.lib import hub
 import time
+import heapq
 
 OSPF_ROUTER_ID = "10.10.10.10"
 OSPF_AREA_ID = "0.0.0.0"
@@ -1209,6 +1210,8 @@ class OSPFv3Controller(app_manager.RyuApp):
             and self.is_router_topology_converged()
         ):
             self.log_router_graph()
+            self.log_spf_result()
+
             self.topology_convergence_logged = True
             
     def install_lsa_in_lsdb(self, lsa):
@@ -1404,6 +1407,84 @@ class OSPFv3Controller(app_manager.RyuApp):
                             )
                         })
         return graph
+
+    def run_spf(self):
+        """
+        Runs Dijkstra SPF using the local OSPF Router ID
+        as the root of the topology graph.
+        """
+
+        graph = self.build_router_graph()
+        root = OSPF_ROUTER_ID
+
+        if root not in graph:
+            return {}, {}
+
+        distances = {
+            router_id: float("inf")
+            for router_id in graph
+        }
+
+        previous = {
+            router_id: None
+            for router_id in graph
+        }
+
+        distances[root] = 0
+
+        queue = [
+            (0, root)
+        ]
+
+        while queue:
+            current_cost, current_router = heapq.heappop(queue)
+
+            if current_cost > distances[current_router]:
+                continue
+
+            for link in graph[current_router]:
+                neighbor = link["neighbor"]
+                link_cost = link["cost"]
+
+                new_cost = current_cost + link_cost
+
+                if new_cost < distances[neighbor]:
+                    distances[neighbor] = new_cost
+                    previous[neighbor] = current_router
+
+                    heapq.heappush(
+                        queue,
+                        (new_cost, neighbor)
+                    )
+
+        return distances, previous
+
+    def get_spf_next_hop(self, destination, previous):
+        """
+        Returns the first router after the SPF root
+        on the path toward destination.
+        """
+
+        root = OSPF_ROUTER_ID
+
+        if destination == root:
+            return None
+
+        if destination not in previous:
+            return None
+
+        if previous[destination] is None:
+            return None
+
+        current = destination
+
+        while previous[current] != root:
+            current = previous[current]
+
+            if current is None:
+                return None
+
+        return current
 
     def is_router_topology_converged(self):
         expected_links = {
@@ -1725,6 +1806,42 @@ class OSPFv3Controller(app_manager.RyuApp):
                     link["interface_id"],
                     link["neighbor_interface_id"]
                 )
+
+    def log_spf_result(self):
+        distances, previous = self.run_spf()
+
+        self.logger.info(
+            "\n[OSPF][SPF] root=%s",
+            OSPF_ROUTER_ID
+        )
+
+        router_ids = [OSPF_ROUTER_ID]
+
+        router_ids.extend(
+            sorted(
+                router_id
+                for router_id in distances
+                if router_id != OSPF_ROUTER_ID
+            )
+        )
+
+        for router_id in router_ids:
+            cost = distances[router_id]
+            predecessor = previous[router_id]
+
+            next_hop = self.get_spf_next_hop(
+                router_id,
+                previous
+            )
+
+            self.logger.info(
+                "  router=%s cost=%s "
+                "predecessor=%s next-hop=%s",
+                router_id,
+                cost,
+                predecessor,
+                next_hop
+            )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
