@@ -1211,6 +1211,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         ):
             self.log_router_graph()
             self.log_spf_result()
+            self.log_prefix_advertisements()
 
             self.topology_convergence_logged = True
             
@@ -1485,6 +1486,37 @@ class OSPFv3Controller(app_manager.RyuApp):
                 return None
 
         return current
+
+    def collect_prefix_advertisements(self):
+        """
+        Collects IPv6 prefix advertisements from
+        Intra-Area-Prefix-LSAs stored in the LSDB.
+        """
+
+        advertisements = []
+
+        for lsa in self.lsdb.values():
+
+            # Intra-Area-Prefix-LSA
+            if lsa["ls_type"] != 0x2009:
+                continue
+
+            prefix_lsa = lsa.get("intra_area_prefix_lsa")
+
+            if prefix_lsa is None:
+                continue
+
+            advertising_router = lsa["advertising_router"]
+
+            for prefix in prefix_lsa["prefixes"]:
+                advertisements.append({
+                    "prefix": prefix["prefix"],
+                    "prefix_length": prefix["prefix_length"],
+                    "metric": prefix["metric"],
+                    "advertising_router": advertising_router
+                })
+
+        return advertisements
 
     def is_router_topology_converged(self):
         expected_links = {
@@ -1841,6 +1873,30 @@ class OSPFv3Controller(app_manager.RyuApp):
                 cost,
                 predecessor,
                 next_hop
+            )
+    def log_prefix_advertisements(self):
+        advertisements = self.collect_prefix_advertisements()
+
+        self.logger.info(
+            "\n[OSPF][PREFIXES] advertisements=%d",
+            len(advertisements)
+        )
+
+        advertisements.sort(
+            key=lambda item: (
+                item["advertising_router"],
+                item["prefix"],
+                item["prefix_length"]
+            )
+        )
+
+        for entry in advertisements:
+            self.logger.info(
+                "  %s/%d adv=%s metric=%d",
+                entry["prefix"],
+                entry["prefix_length"],
+                entry["advertising_router"],
+                entry["metric"]
             )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
