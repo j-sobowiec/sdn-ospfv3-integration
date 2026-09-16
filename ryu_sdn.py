@@ -11,6 +11,7 @@ from ryu.lib.packet import ethernet
 from ryu.lib import hub
 import time
 import heapq
+import ipaddress
 
 OSPF_ROUTER_ID = "10.10.10.10"
 OSPF_AREA_ID = "0.0.0.0"
@@ -26,6 +27,14 @@ OSPF_OPTIONS = 0x000013
 
 SDN_MAC = "02:00:00:00:00:01"
 SDN_LINK_LOCAL = "fe80::10"
+
+SDN_TRANSIT_PREFIX = "2001:db8:10::"
+SDN_TRANSIT_PREFIX_LENGTH = 64
+SDN_TRANSIT_IPV6 = "2001:db8:10::2"
+
+SDN_LAN_PREFIX = "2001:db8:1::"
+SDN_LAN_PREFIX_LENGTH = 64
+SDN_LAN_GATEWAY = "2001:db8:1::1"
 
 OSPF_INTERFACE_MTU = 1500
 OSPF_MAX_AGE = 3600
@@ -1530,6 +1539,38 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         routes = {}
 
+        # Locally connected IPv6 networks.
+        connected_routes = [
+            {
+                "prefix": SDN_TRANSIT_PREFIX,
+                "prefix_length": SDN_TRANSIT_PREFIX_LENGTH,
+                "interface": "transit"
+            },
+            {
+                "prefix": SDN_LAN_PREFIX,
+                "prefix_length": SDN_LAN_PREFIX_LENGTH,
+                "interface": "lan"
+            }
+        ]
+
+        for connected in connected_routes:
+            prefix_key = (
+                connected["prefix"],
+                connected["prefix_length"]
+            )
+
+            routes[prefix_key] = {
+                "prefix": connected["prefix"],
+                "prefix_length": connected["prefix_length"],
+                "source": "connected",
+                "advertising_router": None,
+                "router_cost": 0,
+                "prefix_metric": 0,
+                "total_cost": 0,
+                "next_hop": None,
+                "interface": connected["interface"]
+            }
+
         for advertisement in advertisements:
             advertising_router = advertisement[
                 "advertising_router"
@@ -1560,14 +1601,24 @@ class OSPFv3Controller(app_manager.RyuApp):
             candidate = {
                 "prefix": advertisement["prefix"],
                 "prefix_length": advertisement["prefix_length"],
+                "source": "ospf",
                 "advertising_router": advertising_router,
                 "router_cost": router_cost,
                 "prefix_metric": prefix_metric,
                 "total_cost": total_cost,
-                "next_hop": next_hop
+                "next_hop": next_hop,
+                "interface": "transit"
             }
 
             current = routes.get(prefix_key)
+
+            # A connected route always takes precedence
+            # over a route learned through OSPF.
+            if (
+                current is not None
+                and current["source"] == "connected"
+            ):
+                continue
 
             if current is None:
                 routes[prefix_key] = candidate
@@ -1976,17 +2027,41 @@ class OSPFv3Controller(app_manager.RyuApp):
             len(routes)
         )
 
-        for prefix_key in sorted(routes.keys()):
-            route = routes[prefix_key]
+        sorted_routes = sorted(
+            routes.values(),
+            key=lambda route: ipaddress.IPv6Network(
+                (
+                    route["prefix"],
+                    route["prefix_length"]
+                ),
+                strict=False
+            )
+        )
+
+        for route in sorted_routes:
+            self.logger.info(
+                "\n  %s/%d",
+                route["prefix"],
+                route["prefix_length"]
+            )
+
+            if route["source"] == "connected":
+                self.logger.info(
+                    "      source=connected interface=%s",
+                    route["interface"]
+                )
+                continue
 
             self.logger.info(
-                "  %s/%d cost=%d "
-                "adv=%s next-hop=%s",
-                route["prefix"],
-                route["prefix_length"],
+                "      source=ospf cost=%d adv=%s",
                 route["total_cost"],
-                route["advertising_router"],
-                route["next_hop"]
+                route["advertising_router"]
+            )
+
+            self.logger.info(
+                "      next-hop=%s interface=%s",
+                route["next_hop"],
+                route["interface"]
             )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)

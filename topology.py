@@ -184,7 +184,7 @@ def main():
             {
                 "r1-eth0": "2001:db8:12::1/64",
                 "r1-eth1": "2001:db8:31::1/64",
-                "r1-eth2": "2001:db8:1::1/64",
+                "r1-eth2": "2001:db8:10::1/64",
             },
             router_id="1.1.1.1",
             active_interfaces=("r1-eth0", "r1-eth1", "r1-eth2"),
