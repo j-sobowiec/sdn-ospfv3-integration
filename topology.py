@@ -21,7 +21,6 @@ zebra_options="-A 127.0.0.1 -s 90000000"
 ospf6d_options="-A ::1"
 """
 
-
 def write_file(node, path, text):
     """Zapisz krótki plik tekstowy wewnątrz kontenera."""
     node.cmd("mkdir -p /etc/frr /run/frr")
@@ -99,34 +98,50 @@ def configure_router(router, addresses, router_id, active_interfaces,
 
 
 def start_frr(router):
+    """Start FRR and load /etc/frr/frr.conf."""
 
-    """Uruchom FRR i wczytaj /etc/frr/frr.conf."""
-    output = router.cmd(
+    # Run the FRR startup script with stdin/stdout/stderr detached
+    # from the interactive Mininet/Containernet node shell.
+    router.cmd(
+        "rm -f /tmp/frr-start.log; "
         "if [ -x /usr/lib/frr/frrinit.sh ]; then "
-        "/usr/lib/frr/frrinit.sh start; "
+        "/usr/lib/frr/frrinit.sh start "
+        "</dev/null >/tmp/frr-start.log 2>&1; "
         "elif [ -x /etc/init.d/frr ]; then "
-        "/etc/init.d/frr start; "
+        "/etc/init.d/frr start "
+        "</dev/null >/tmp/frr-start.log 2>&1; "
         "else "
-        "echo 'Nie znaleziono skryptu startowego FRR'; "
+        "echo 'FRR startup script not found' "
+        ">/tmp/frr-start.log; "
         "fi"
     )
+
+    # Read startup output separately, after the command has returned.
+    output = router.cmd(
+        "cat /tmp/frr-start.log 2>/dev/null"
+    )
+
     if output.strip():
-        info(f"*** {router.name}: {output.strip()}\n")
-
-    # Daj demonom czas na utworzenie gniazd /run/frr/*.vty.
-    time.sleep(2)
-
-    # Nie przerywamy programu przez pidof/kill -0, ponieważ w części
-    # obrazów kontenerowych dają one fałszywy wynik mimo działających demonów.
-    sockets = router.cmd("ls /run/frr/*.vty 2>/dev/null")
-    if "zebra.vty" not in sockets or "ospf6d.vty" not in sockets:
         info(
-            f"*** WARNING: no VTY sockets on {router.name}:\n"
-            f"{sockets}\n"
+            f"*** {router.name}: "
+            f"{output.strip()}\n"
         )
 
-    info(f"*** {router.name}: finished starting FRR\n")
+    # Give the daemons time to create VTY sockets.
+    time.sleep(2)
 
+    sockets = router.cmd(
+        "ls /run/frr/*.vty 2>/dev/null"
+    )
+
+    if (
+        "zebra.vty" not in sockets
+        or "ospf6d.vty" not in sockets
+    ):
+        info(
+            f"*** WARNING: no VTY sockets on "
+            f"{router.name}:\n{sockets}\n"
+        )
 
 def main():
     net = Containernet(controller=None, switch=OVSSwitch)
