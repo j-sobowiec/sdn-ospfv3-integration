@@ -862,12 +862,11 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.lsr_sent = False
 
         self.lsdb = {}
+        self.ipv6_routing_table = {}
 
         self.hello_thread = hub.spawn(self.hello_loop)
         
         self.lsdb_aging_thread = hub.spawn(self.lsdb_aging_loop)
-
-        self.topology_convergence_logged = False
 
     def send_ospfv3_hello(self):
         if self.datapath is None or self.ospf_port is None:
@@ -1120,6 +1119,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         Installs new LSAs in the local LSDB and replaces
         existing entries only when a newer instance is received.
         """
+        routing_changed = False
 
         for received in received_lsa_headers:
             key = (
@@ -1149,6 +1149,9 @@ class OSPFv3Controller(app_manager.RyuApp):
                     if comparison >= 0:
                         del self.lsdb[key]
 
+                        if received["ls_type"] in (0x2001, 0x2009):
+                            routing_changed = True
+
                         self.logger.info(
                             "[OSPF][LSDB] flushed %s "
                             "adv=%s lsid=%s",
@@ -1164,6 +1167,9 @@ class OSPFv3Controller(app_manager.RyuApp):
             # LSA nie istnieje jeszcze w LSDB.
             if current is None:
                 self.lsdb[key] = self.install_lsa_in_lsdb(received)
+
+                if received["ls_type"] in (0x2001, 0x2009):
+                    routing_changed = True
 
                 self.logger.info(
                     "[OSPF][LSDB] installed %s "
@@ -1195,6 +1201,9 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                 self.lsdb[key] = self.install_lsa_in_lsdb(received)
 
+                if received["ls_type"] in (0x2001, 0x2009):
+                    routing_changed = True
+
                 self.logger.info(
                     "[OSPF][LSDB] updated %s "
                     "adv=%s lsid=%s "
@@ -1214,16 +1223,8 @@ class OSPFv3Controller(app_manager.RyuApp):
             # comparison < 0:
             # starsza instancja - rowniez nic nie robimy.
 
-        if (
-            not self.topology_convergence_logged
-            and self.is_router_topology_converged()
-        ):
-            self.log_router_graph()
-            self.log_spf_result()
-            self.log_prefix_advertisements()
-            self.log_ipv6_routing_table()
-
-            self.topology_convergence_logged = True
+        if routing_changed:
+            self.recompute_routing_state()
             
     def install_lsa_in_lsdb(self, lsa):
         entry = dict(lsa)
@@ -1256,7 +1257,15 @@ class OSPFv3Controller(app_manager.RyuApp):
         )
 
     def purge_expired_lsas(self):
+        """
+        Removes LSAs that reached MaxAge.
+
+        Returns True if the removal affects routing
+        and SPF should be recalculated.
+        """
+
         expired_keys = []
+        routing_changed = False
 
         for key, lsa in self.lsdb.items():
             current_age = self.get_lsdb_lsa_age(lsa)
@@ -1267,17 +1276,21 @@ class OSPFv3Controller(app_manager.RyuApp):
         for key in expired_keys:
             lsa = self.lsdb.pop(key)
 
+            if lsa["ls_type"] in (0x2001, 0x2009):
+                routing_changed = True
+
             self.logger.info(
                 "[OSPF][LSDB] removed expired %s "
-                "adv=%s lsid=%s age=%ds remaining=%d",
+                "adv=%s lsid=%s age=%ds",
                 ospfv3_lsa_type_description(
                     lsa["ls_type"]
                 ),
                 lsa["advertising_router"],
                 lsa["link_state_id"],
-                OSPF_MAX_AGE,
-                len(self.lsdb)
+                OSPF_MAX_AGE
             )
+
+        return routing_changed
 
     def lsdb_aging_loop(self):
         self.logger.info(
@@ -1286,8 +1299,18 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         while True:
             hub.sleep(5)
-            if self.lsdb:
-                self.purge_expired_lsas()
+
+            if not self.lsdb:
+                continue
+
+            routing_changed = self.purge_expired_lsas()
+
+            if routing_changed:
+                self.logger.info(
+                    "[OSPF][ROUTING] LSDB expiration triggered SPF"
+                )
+
+                self.recompute_routing_state()
 
     def send_ls_ack(self, lsa_headers):
         if self.datapath is None or self.ospf_port is None:
@@ -1638,40 +1661,29 @@ class OSPFv3Controller(app_manager.RyuApp):
                 routes[prefix_key] = candidate
 
         return routes
-    def is_router_topology_converged(self):
-        expected_links = {
-            "1.1.1.1": 3,
-            "2.2.2.2": 2,
-            "3.3.3.3": 2,
-        }
 
-        for router_id, expected_count in expected_links.items():
-            key = (
-                0x2001,
-                "0.0.0.0",
-                router_id
+    def recompute_routing_state(self):
+        """
+        Recalculates SPF and rebuilds the IPv6 routing table
+        after a relevant LSDB change.
+        """
+
+        new_routes = self.build_ipv6_routing_table()
+
+        if new_routes == self.ipv6_routing_table:
+            self.logger.info(
+                "[OSPF][ROUTING] recalculated - no route changes"
             )
+            return
 
-            lsa = self.lsdb.get(key)
+        self.ipv6_routing_table = new_routes
 
-            if lsa is None:
-                return False
+        self.logger.info(
+            "[OSPF][ROUTING] routing table changed"
+        )
 
-            router_lsa = lsa.get("router_lsa")
-
-            if router_lsa is None:
-                return False
-
-            p2p_links = [
-                link
-                for link in router_lsa["links"]
-                if link["type"] == 1
-            ]
-
-            if len(p2p_links) != expected_count:
-                return False
-
-        return True
+        self.log_spf_result()
+        self.log_ipv6_routing_table()
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -2020,7 +2032,7 @@ class OSPFv3Controller(app_manager.RyuApp):
             )
 
     def log_ipv6_routing_table(self):
-        routes = self.build_ipv6_routing_table()
+        routes = self.ipv6_routing_table
 
         self.logger.info(
             "\n[OSPF][ROUTES] IPv6 routing table entries=%d",
