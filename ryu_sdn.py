@@ -40,6 +40,8 @@ OSPF_INTERFACE_MTU = 1500
 OSPF_MAX_AGE = 3600
 OSPF_MAX_AGE_DIFF = 900
 
+OSPF_INITIAL_SEQUENCE = 0x80000001
+
 def build_ospfv3_hello(neighbors=()):
     version = 3
     pkt_type = 1
@@ -839,6 +841,72 @@ def compare_lsa_instances(first, second):
     # instancje sa traktowane jako identyczne.
     return 0
 
+def ospfv3_lsa_checksum(lsa_bytes):
+    """
+    Calculates the Fletcher checksum for an OSPFv3 LSA.
+
+    The LS Age field is excluded from the checksum calculation.
+    The checksum field itself must be treated as zero.
+    """
+
+    if len(lsa_bytes) < 20:
+        raise ValueError("LSA is too short for checksum calculation")
+
+    data = bytearray(lsa_bytes)
+
+    # LSA checksum field is located at bytes 16-17.
+    data[16] = 0
+    data[17] = 0
+
+    c0 = 0
+    c1 = 0
+
+    # LS Age occupies bytes 0-1 and is excluded.
+    for value in data[2:]:
+        c0 = (c0 + value) % 255
+        c1 = (c1 + c0) % 255
+
+    checksum_data_length = len(data) - 2
+
+    x = (
+        (checksum_data_length - 15) * c0 - c1
+    ) % 255
+
+    if x <= 0:
+        x += 255
+
+    y = 510 - c0 - x
+
+    if y > 255:
+        y -= 255
+
+    return (x << 8) | y
+
+def finalize_ospfv3_lsa_checksum(lsa_bytes):
+    """
+    Inserts the calculated Fletcher checksum
+    into an OSPFv3 LSA.
+    """
+
+    data = bytearray(lsa_bytes)
+
+    if len(data) < 20:
+        raise ValueError("LSA is too short")
+
+    data[16] = 0
+    data[17] = 0
+
+    checksum = ospfv3_lsa_checksum(data)
+
+    struct.pack_into(
+        "!H",
+        data,
+        16,
+        checksum
+    )
+
+    return bytes(data)
+
 class OSPFv3Controller(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -863,6 +931,12 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         self.lsdb = {}
         self.ipv6_routing_table = {}
+
+        self.local_router_lsa_sequence = OSPF_INITIAL_SEQUENCE
+        self.local_prefix_lsa_sequence = OSPF_INITIAL_SEQUENCE
+        self.local_link_lsa_sequence = OSPF_INITIAL_SEQUENCE
+
+        self.ospf_neighbor_router_id = None
 
         self.hello_thread = hub.spawn(self.hello_loop)
         
@@ -2178,6 +2252,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                     self.ospf_port = in_port
                     self.ospf_neighbor_ipv6 = ipv6_pkt.src
                     self.ospf_neighbor_mac = eth_pkt.src
+                    self.ospf_neighbor_router_id = router_id_text
 
                     if router_id_text not in self.ospf_neighbors:
                         self.ospf_neighbors.append(router_id_text)
@@ -2434,7 +2509,21 @@ class OSPFv3Controller(app_manager.RyuApp):
                         raw_lsa = bytes(
                             ospf_data[offset:offset + ls_length]
                         )
-                        
+
+                        calculated_lsa_checksum = ospfv3_lsa_checksum(
+                            raw_lsa
+                        )
+
+                        self.logger.info(
+                            "[OSPF][LSA CHECKSUM] "
+                            "type=%s received=0x%04x "
+                            "calculated=0x%04x valid=%s",
+                            ospfv3_lsa_type_description(ls_type),
+                            ls_checksum,
+                            calculated_lsa_checksum,
+                            ls_checksum == calculated_lsa_checksum
+                        )
+
                         lsa_header = {
                             "ls_age": ls_age,
                             "ls_type": ls_type,

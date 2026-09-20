@@ -71,7 +71,7 @@ def configure_router(router, addresses, router_id, active_interfaces,
     router.cmd("sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null")
     router.cmd("sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null")
 
-    for interface, address in addresses.items():
+    for interface, address in addresses.items():       
         router.cmd(f"ip link set dev {interface} up")
         router.cmd(f"ip -4 addr flush dev {interface}")
         router.cmd(f"ip -6 addr replace {address} dev {interface}")
@@ -117,9 +117,7 @@ def start_frr(router):
     )
 
     # Read startup output separately, after the command has returned.
-    output = router.cmd(
-        "cat /tmp/frr-start.log 2>/dev/null"
-    )
+    output = router.cmd("cat /tmp/frr-start.log 2>/dev/null")
 
     if output.strip():
         info(
@@ -130,16 +128,14 @@ def start_frr(router):
     # Give the daemons time to create VTY sockets.
     time.sleep(2)
 
-    sockets = router.cmd(
-        "ls /run/frr/*.vty 2>/dev/null"
-    )
+    sockets = router.cmd("ls /run/frr/*.vty 2>/dev/null")
 
     if (
         "zebra.vty" not in sockets
         or "ospf6d.vty" not in sockets
     ):
         info(
-            f"*** WARNING: no VTY sockets on "
+            f"WARNING: no VTY sockets on "
             f"{router.name}:\n{sockets}\n"
         )
 
@@ -154,7 +150,7 @@ def main():
         port=6653
         )
 
-        info("*** Adding FRR routers\n")
+        info("Adding FRR routers\n")
         docker_params = dict(
             ip=None,
             dimage=FRR_IMAGE,
@@ -228,30 +224,28 @@ def main():
         h1.cmd("ip link set dev h1-eth0 up")
         h1.cmd("ip -4 addr flush dev h1-eth0")
         h1.cmd("ip -6 addr replace 2001:db8:1::100/64 dev h1-eth0")
-        h1.cmd(
-            "ip -6 route replace default via 2001:db8:1::1 dev h1-eth0"
-        )
+        h1.cmd("ip -6 route replace default via 2001:db8:1::1 dev h1-eth0")
 
     
-        info("*** Starting routers and daemons\n")
+        info("Starting routers and daemons\n")
         net.start()
 
-        info("*** Controler s1:\n")
+        info("Controler s1:\n")
         info(s1.cmd("ovs-vsctl get-controller s1"))
 
-        info("*** OpenFlow flows:\n")
+        info("OpenFlow flows:\n")
         info(s1.cmd("ovs-ofctl -O OpenFlow13 dump-flows s1"))
 
         for router in (r1, r2, r3):
             start_frr(router)
 
-        info("\n*** Example commands in CLI:\n")
+        info("\nExample commands in CLI:\n")
         info("r1 vtysh -c 'show ipv6 ospf6 neighbor'\n")
         info("r2 vtysh -c 'show ipv6 route ospf6'\n")
         info("h1 ping -6 -c 3 2001:db8:23::3\n\n")
         CLI(net)
     finally:
-        info("*** Stopping network\n")
+        info("Stopping network\n")
         net.stop()
 
 
