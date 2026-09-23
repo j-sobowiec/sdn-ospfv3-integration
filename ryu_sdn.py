@@ -45,10 +45,13 @@ OSPF_INTERFACE_COST = 10
 
 OSPF_LAN_PREFIX_METRIC = 10
 
-def build_ospfv3_hello(neighbors=()):
-    version = 3
-    pkt_type = 1
-    pkt_len = 36 + 4 * len(neighbors)
+def build_ospfv3_packet(pkt_type, body, dst_ipv6):
+    """
+    Builds a complete OSPFv3 packet:
+        common OSPF header + packet-specific body + checksum.
+    """
+
+    pkt_len = 16 + len(body)
 
     router_id = struct.unpack(
         "!I",
@@ -60,23 +63,42 @@ def build_ospfv3_hello(neighbors=()):
         socket.inet_aton(OSPF_AREA_ID)
     )[0]
 
-    # Najpierw budujemy pakiet z checksum = 0
-    checksum = 0
-    reserved = 0
-
     ospf_header = struct.pack(
         "!BBHIIHBB",
-        version,
+        3,                  # Version
         pkt_type,
         pkt_len,
         router_id,
         area_id,
-        checksum,
+        0,                  # Checksum filled later
         OSPF_INSTANCE_ID,
-        reserved
+        0                   # Reserved
     )
 
-    options = OSPF_OPTIONS.to_bytes(3, byteorder="big")
+    ospf_packet = ospf_header + body
+
+    checksum = calculate_ospfv3_checksum(
+        SDN_LINK_LOCAL,
+        dst_ipv6,
+        ospf_packet
+    )
+
+    ospf_packet = bytearray(ospf_packet)
+
+    struct.pack_into(
+        "!H",
+        ospf_packet,
+        12,
+        checksum
+    )
+
+    return bytes(ospf_packet)
+
+def build_ospfv3_hello(neighbors=()):
+    options = OSPF_OPTIONS.to_bytes(
+        3,
+        byteorder="big"
+    )
 
     hello_body = struct.pack(
         "!IB3sHHII",
@@ -85,192 +107,88 @@ def build_ospfv3_hello(neighbors=()):
         options,
         OSPF_HELLO_INTERVAL,
         OSPF_DEAD_INTERVAL,
-        0,  # DR
-        0   # BDR
-    )
-    neighbor_data = b""
-
-    for neighbor in neighbors:
-        neighbor_data += socket.inet_aton(neighbor)
-
-    ospf_packet = ospf_header + hello_body + neighbor_data
-
-    # Liczymy checksum z uwzględnieniem IPv6 pseudo-header
-    checksum = calculate_ospfv3_checksum(
-        SDN_LINK_LOCAL,
-        "ff02::5",
-        ospf_packet
+        0,      # DR
+        0       # BDR
     )
 
-    # Wstawiamy checksum do bajtów 12-13 nagłówka OSPFv3
-    ospf_packet = bytearray(ospf_packet)
-
-    ospf_packet[12:14] = struct.pack(
-        "!H",
-        checksum
+    neighbor_data = b"".join(
+        socket.inet_aton(neighbor)
+        for neighbor in neighbors
     )
 
-    return bytes(ospf_packet)
+    body = hello_body + neighbor_data
+
+    return build_ospfv3_packet(
+        pkt_type=1,
+        body=body,
+        dst_ipv6="ff02::5"
+    )
 
 def build_ospfv3_dbd(dd_sequence, flags=0x07):
-    version = 3
-    pkt_type = 2
-    pkt_len = 28
-
-    router_id = struct.unpack(
-        "!I",
-        socket.inet_aton(OSPF_ROUTER_ID)
-    )[0]
-
-    area_id = struct.unpack(
-        "!I",
-        socket.inet_aton(OSPF_AREA_ID)
-    )[0]
-
-    ospf_header = struct.pack(
-        "!BBHIIHBB",
-        version,
-        pkt_type,
-        pkt_len,
-        router_id,
-        area_id,
-        0,                  # checksum najpierw 0
-        OSPF_INSTANCE_ID,
-        0
+    options = OSPF_OPTIONS.to_bytes(
+        3,
+        byteorder="big"
     )
 
-    options = OSPF_OPTIONS.to_bytes(3, byteorder="big")
-
-    dbd_body = struct.pack(
+    body = struct.pack(
         "!B3sHBBI",
-        0,                  # reserved
+        0,                  # Reserved
         options,
         OSPF_INTERFACE_MTU,
-        0,                  # reserved
+        0,                  # Reserved
         flags,
         dd_sequence
     )
 
-    ospf_packet = ospf_header + dbd_body
-
-    checksum = calculate_ospfv3_checksum(
-        SDN_LINK_LOCAL,
-        "ff02::5",
-        ospf_packet
+    return build_ospfv3_packet(
+        pkt_type=2,
+        body=body,
+        dst_ipv6="ff02::5"
     )
 
-    ospf_packet = bytearray(ospf_packet)
-    ospf_packet[12:14] = struct.pack("!H", checksum)
-
-    return bytes(ospf_packet)
-
 def build_ospfv3_lsr(lsa_requests, dst_ipv6):
-    version = 3
-    pkt_type = 3
-
     requests_data = b""
 
     for lsa in lsa_requests:
         link_state_id = struct.unpack(
             "!I",
-            socket.inet_aton(lsa["link_state_id"])
+            socket.inet_aton(
+                lsa["link_state_id"]
+            )
         )[0]
 
         advertising_router = struct.unpack(
             "!I",
-            socket.inet_aton(lsa["advertising_router"])
+            socket.inet_aton(
+                lsa["advertising_router"]
+            )
         )[0]
 
         requests_data += struct.pack(
             "!HHII",
-            0,                          # reserved
+            0,                          # Reserved
             lsa["ls_type"],
             link_state_id,
             advertising_router
         )
 
-    pkt_len = 16 + len(requests_data)
-
-    router_id = struct.unpack(
-        "!I",
-        socket.inet_aton(OSPF_ROUTER_ID)
-    )[0]
-
-    area_id = struct.unpack(
-        "!I",
-        socket.inet_aton(OSPF_AREA_ID)
-    )[0]
-
-    ospf_header = struct.pack(
-        "!BBHIIHBB",
-        version,
-        pkt_type,
-        pkt_len,
-        router_id,
-        area_id,
-        0,                  # checksum tymczasowo 0
-        OSPF_INSTANCE_ID,
-        0
+    return build_ospfv3_packet(
+        pkt_type=3,
+        body=requests_data,
+        dst_ipv6=dst_ipv6
     )
-
-    ospf_packet = ospf_header + requests_data
-
-    checksum = calculate_ospfv3_checksum(
-        SDN_LINK_LOCAL,
-        dst_ipv6,
-        ospf_packet
-    )
-
-    ospf_packet = bytearray(ospf_packet)
-    ospf_packet[12:14] = struct.pack("!H", checksum)
-
-    return bytes(ospf_packet)
 
 def build_ospfv3_lsack(lsa_headers, dst_ipv6):
-    version = 3
-    pkt_type = 5
-
-    ack_data = b""
-
-    for lsa in lsa_headers:
-        ack_data += lsa["raw_header"]
-
-    pkt_len = 16 + len(ack_data)
-
-    router_id = struct.unpack(
-        "!I",
-        socket.inet_aton(OSPF_ROUTER_ID)
-    )[0]
-
-    area_id = struct.unpack(
-        "!I",
-        socket.inet_aton(OSPF_AREA_ID)
-    )[0]
-
-    ospf_header = struct.pack(
-        "!BBHIIHBB",
-        version,
-        pkt_type,
-        pkt_len,
-        router_id,
-        area_id,
-        0,                  # checksum na razie 0
-        OSPF_INSTANCE_ID,
-        0
+    ack_data = b"".join(
+        lsa["raw_header"]
+        for lsa in lsa_headers
     )
 
-    ospf_packet = ospf_header + ack_data
-
-    checksum = calculate_ospfv3_checksum(
-        SDN_LINK_LOCAL,
-        dst_ipv6,
-        ospf_packet
+    return build_ospfv3_packet(
+        pkt_type=5,
+        body=ack_data,
+        dst_ipv6=dst_ipv6
     )
-
-    ospf_packet = bytearray(ospf_packet)
-    ospf_packet[12:14] = struct.pack("!H", checksum)
-
-    return bytes(ospf_packet)
 
 def calculate_ospfv3_checksum(src_ipv6, dst_ipv6, ospf_packet):
     pseudo_header = (
