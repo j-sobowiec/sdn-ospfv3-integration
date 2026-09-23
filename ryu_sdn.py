@@ -817,20 +817,20 @@ class OSPFv3Controller(app_manager.RyuApp):
         
         self.lsdb_aging_thread = hub.spawn(self.lsdb_aging_loop)
 
-    def send_ospfv3_hello(self):
-        if self.datapath is None or self.ospf_port is None:
-            return
+    def send_frame(self, frame, out_port):
+        """
+        Sends a raw Ethernet frame through the specified OpenFlow port.
+        """
+
+        if self.datapath is None:
+            return False
 
         datapath = self.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        frame = build_ospfv3_hello_frame(
-            self.ospf_neighbors
-        )
-
         actions = [
-            parser.OFPActionOutput(self.ospf_port)
+            parser.OFPActionOutput(out_port)
         ]
 
         packet_out = parser.OFPPacketOut(
@@ -842,6 +842,22 @@ class OSPFv3Controller(app_manager.RyuApp):
         )
 
         datapath.send_msg(packet_out)
+
+        return True
+
+    def send_ospfv3_hello(self):
+        if self.ospf_port is None:
+            return
+
+        frame = build_ospfv3_hello_frame(
+            self.ospf_neighbors
+        )
+
+        if not self.send_frame(
+            frame,
+            self.ospf_port
+        ):
+            return
 
         self.logger.info(
             "[OSPF][HELLO TX] port=%s neighbors=%s",
@@ -857,33 +873,19 @@ class OSPFv3Controller(app_manager.RyuApp):
             hub.sleep(OSPF_HELLO_INTERVAL)
 
     def send_initial_dbd(self):
-        if self.datapath is None or self.ospf_port is None:
+        if self.ospf_port is None:
             return
-
-        datapath = self.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
 
         frame = build_ospfv3_dbd_frame(
             self.dbd_sequence,
             flags=0x07
         )
 
-        actions = [
-            parser.OFPActionOutput(
-                self.ospf_port
-            )
-        ]
-
-        packet_out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=ofproto.OFPP_CONTROLLER,
-            actions=actions,
-            data=frame
-        )
-
-        datapath.send_msg(packet_out)
+        if not self.send_frame(
+            frame,
+            self.ospf_port
+        ):
+            return
 
         self.logger.info(
             "[OSPF][DBD TX] initial "
@@ -892,31 +894,19 @@ class OSPFv3Controller(app_manager.RyuApp):
         )
 
     def send_exchange_dbd(self):
-        if self.datapath is None or self.ospf_port is None:
+        if self.ospf_port is None:
             return
-
-        datapath = self.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
 
         frame = build_ospfv3_dbd_frame(
             self.dbd_sequence,
             flags=0x01
         )
 
-        actions = [
-            parser.OFPActionOutput(self.ospf_port)
-        ]
-
-        packet_out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=ofproto.OFPP_CONTROLLER,
-            actions=actions,
-            data=frame
-        )
-
-        datapath.send_msg(packet_out)
+        if not self.send_frame(
+            frame,
+            self.ospf_port
+        ):
+            return
 
         self.logger.info(
             "[OSPF][DBD TX] exchange "
@@ -950,7 +940,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         )
 
     def send_link_state_request(self):
-        if self.datapath is None or self.ospf_port is None:
+        if self.ospf_port is None:
             return
 
         if self.ospf_neighbor_ipv6 is None:
@@ -965,29 +955,17 @@ class OSPFv3Controller(app_manager.RyuApp):
             )
             return
 
-        datapath = self.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
         frame = build_ospfv3_lsr_frame(
             self.lsa_request_list,
             self.ospf_neighbor_ipv6,
             self.ospf_neighbor_mac
         )
 
-        actions = [
-            parser.OFPActionOutput(self.ospf_port)
-        ]
-
-        packet_out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=ofproto.OFPP_CONTROLLER,
-            actions=actions,
-            data=frame
-        )
-
-        datapath.send_msg(packet_out)
+        if not self.send_frame(
+            frame,
+            self.ospf_port
+        ):
+            return
 
         self.lsr_sent = True
 
@@ -997,10 +975,7 @@ class OSPFv3Controller(app_manager.RyuApp):
             len(self.lsa_request_list)
         )
 
-        for index, lsa in enumerate(
-            self.lsa_request_list,
-            start=1
-        ):
+        for lsa in self.lsa_request_list:
             self.logger.info(
                 "  -> %s adv=%s lsid=%s",
                 ospfv3_lsa_type_description(
@@ -1009,6 +984,37 @@ class OSPFv3Controller(app_manager.RyuApp):
                 lsa["advertising_router"],
                 lsa["link_state_id"]
             )
+
+    def send_ls_ack(self, lsa_headers):
+        if self.ospf_port is None:
+            return
+
+        if self.ospf_neighbor_ipv6 is None:
+            return
+
+        if self.ospf_neighbor_mac is None:
+            return
+
+        if not lsa_headers:
+            return
+
+        frame = build_ospfv3_lsack_frame(
+            lsa_headers,
+            self.ospf_neighbor_ipv6,
+            self.ospf_neighbor_mac
+        )
+
+        if not self.send_frame(
+            frame,
+            self.ospf_port
+        ):
+            return
+
+        self.logger.info(
+            "[OSPF][LSAck TX] to=%s count=%d",
+            self.ospf_neighbor_ipv6,
+            len(lsa_headers)
+        )
 
     def update_lsa_request_list(self, received_lsa_headers):
         """
@@ -1260,49 +1266,6 @@ class OSPFv3Controller(app_manager.RyuApp):
                 )
 
                 self.recompute_routing_state()
-
-    def send_ls_ack(self, lsa_headers):
-        if self.datapath is None or self.ospf_port is None:
-            return
-
-        if self.ospf_neighbor_ipv6 is None:
-            return
-
-        if self.ospf_neighbor_mac is None:
-            return
-
-        if not lsa_headers:
-            return
-
-        datapath = self.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        frame = build_ospfv3_lsack_frame(
-            lsa_headers,
-            self.ospf_neighbor_ipv6,
-            self.ospf_neighbor_mac
-        )
-
-        actions = [
-            parser.OFPActionOutput(self.ospf_port)
-        ]
-
-        packet_out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=ofproto.OFPP_CONTROLLER,
-            actions=actions,
-            data=frame
-        )
-
-        datapath.send_msg(packet_out)
-
-        self.logger.info(
-            "[OSPF][LSAck TX] to=%s count=%d",
-            self.ospf_neighbor_ipv6,
-            len(lsa_headers)
-        )
 
     def build_router_graph(self):
         """
