@@ -2381,6 +2381,189 @@ class OSPFv3Controller(app_manager.RyuApp):
             neighbors
         )
 
+    def handle_ospf_dbd(
+        self,
+        in_port,
+        ipv6_pkt,
+        ospf_data,
+        pkt_len,
+        router_id,
+        router_id_text,
+        area_id_text
+    ):
+        """
+        Handles a received OSPFv3 Database Description packet.
+        """
+
+        dbd_data = ospf_data[16:28]
+
+        (
+            reserved1,
+            options_raw,
+            interface_mtu,
+            reserved2,
+            flags,
+            dd_sequence
+        ) = struct.unpack(
+            "!B3sHBBI",
+            dbd_data
+        )
+
+        options = int.from_bytes(
+            options_raw,
+            byteorder="big"
+        )
+
+        i_bit = bool(flags & 0x04)
+        m_bit = bool(flags & 0x02)
+        ms_bit = bool(flags & 0x01)
+
+        lsa_headers = []
+
+        lsa_data = ospf_data[28:pkt_len]
+
+        if len(lsa_data) % 20 != 0:
+            self.logger.warning(
+                "[OSPF][DBD] invalid LSA-summary length=%d",
+                len(lsa_data)
+            )
+            return
+
+        for offset in range(
+            0,
+            len(lsa_data),
+            20
+        ):
+            (
+                ls_age,
+                ls_type,
+                link_state_id,
+                advertising_router,
+                ls_sequence,
+                ls_checksum,
+                ls_length
+            ) = struct.unpack(
+                "!HHIIIHH",
+                lsa_data[offset:offset + 20]
+            )
+
+            lsa_headers.append({
+                "ls_age": ls_age,
+                "ls_type": ls_type,
+                "link_state_id": socket.inet_ntoa(
+                    struct.pack(
+                        "!I",
+                        link_state_id
+                    )
+                ),
+                "advertising_router": socket.inet_ntoa(
+                    struct.pack(
+                        "!I",
+                        advertising_router
+                    )
+                ),
+                "ls_sequence": ls_sequence,
+                "ls_checksum": ls_checksum,
+                "ls_length": ls_length
+            })
+
+        self.log_dbd(
+            in_port,
+            ipv6_pkt,
+            router_id_text,
+            area_id_text,
+            interface_mtu,
+            options,
+            i_bit,
+            m_bit,
+            ms_bit,
+            dd_sequence,
+            lsa_headers
+        )
+
+        local_router_id = struct.unpack(
+            "!I",
+            socket.inet_aton(OSPF_ROUTER_ID)
+        )[0]
+
+        is_initial_dbd = (
+            i_bit
+            and m_bit
+            and ms_bit
+            and pkt_len == 28
+            and local_router_id > router_id
+        )
+
+        if is_initial_dbd:
+            if (
+                self.dbd_negotiated
+                or self.dbd_exchange_complete
+            ):
+                self.reset_dbd_state(
+                    "neighbor restarted ExStart"
+                )
+
+            self.logger.info(
+                "[OSPF][DBD] ExStart "
+                "local=%s peer=%s role=Master",
+                OSPF_ROUTER_ID,
+                router_id_text
+            )
+
+            self.send_initial_dbd()
+
+        elif (
+            not self.dbd_negotiated
+            and not i_bit
+            and not ms_bit
+            and dd_sequence == self.dbd_sequence
+            and local_router_id > router_id
+        ):
+            self.logger.info(
+                "[OSPF][DBD] negotiation-complete "
+                "role=Master seq=0x%08x",
+                dd_sequence
+            )
+
+            self.dbd_negotiated = True
+            self.lsa_request_list = list(
+                lsa_headers
+            )
+
+            self.logger.info(
+                "[OSPF][DBD] request-list=%d",
+                len(self.lsa_request_list)
+            )
+
+            self.dbd_sequence = (
+                self.dbd_sequence + 1
+            ) & 0xffffffff
+
+            self.send_exchange_dbd()
+
+        elif (
+            self.dbd_negotiated
+            and not self.dbd_exchange_complete
+            and not i_bit
+            and not m_bit
+            and not ms_bit
+            and dd_sequence == self.dbd_sequence
+        ):
+            self.dbd_exchange_complete = True
+
+            self.logger.info(
+                "[OSPF][DBD] exchange-complete "
+                "seq=0x%08x pending=%d",
+                dd_sequence,
+                len(self.lsa_request_list)
+            )
+
+            if (
+                self.lsa_request_list
+                and not self.lsr_sent
+            ):
+                self.send_link_state_request()
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -2452,172 +2635,18 @@ class OSPFv3Controller(app_manager.RyuApp):
                     )
 
                 elif version == 3 and pkt_type == 2 and pkt_len >= 28:
-                    dbd_data = ospf_data[16:28]
 
-                    (
-                        reserved1,
-                        options_raw,
-                        interface_mtu,
-                        reserved2,
-                        flags,
-                        dd_sequence
-                    ) = struct.unpack(
-                        "!B3sHBBI",
-                        dbd_data
-                    )
-
-                    options = int.from_bytes(
-                        options_raw,
-                        byteorder="big"
-                    )
-
-                    i_bit = bool(flags & 0x04)
-                    m_bit = bool(flags & 0x02)
-                    ms_bit = bool(flags & 0x01)
-
-                    lsa_headers = []
-
-                    lsa_data = ospf_data[28:pkt_len]
-
-                    if len(lsa_data) % 20 != 0:
-                        self.logger.warning(
-                            "[OSPF][DBD] invalid LSA-summary length=%d",
-                            len(lsa_data)
-                        )
-                        return
-
-                    for offset in range(0, len(lsa_data), 20):
-                        (
-                            ls_age,
-                            ls_type,
-                            link_state_id,
-                            advertising_router,
-                            ls_sequence,
-                            ls_checksum,
-                            ls_length
-                        ) = struct.unpack(
-                            "!HHIIIHH",
-                            lsa_data[offset:offset + 20]
-                        )
-
-                        lsa_header = {
-                            "ls_age": ls_age,
-                            "ls_type": ls_type,
-                            "link_state_id": socket.inet_ntoa(
-                                struct.pack("!I", link_state_id)
-                            ),
-                            "advertising_router": socket.inet_ntoa(
-                                struct.pack("!I", advertising_router)
-                            ),
-                            "ls_sequence": ls_sequence,
-                            "ls_checksum": ls_checksum,
-                            "ls_length": ls_length
-                        }
-
-                        lsa_headers.append(lsa_header)
-
-                    # UWAGA:
-                    # logowanie dopiero PO sparsowaniu wszystkich naglowkow LSA
-                    self.log_dbd(
+                    self.handle_ospf_dbd(
                         in_port,
                         ipv6_pkt,
+                        ospf_data,
+                        pkt_len,
+                        router_id,
                         router_id_text,
-                        area_id_text,
-                        interface_mtu,
-                        options,
-                        i_bit,
-                        m_bit,
-                        ms_bit,
-                        dd_sequence,
-                        lsa_headers
+                        area_id_text
                     )
-
-                    local_router_id = struct.unpack(
-                        "!I",
-                        socket.inet_aton(OSPF_ROUTER_ID)
-                    )[0]
-
-                    # R1 wysyła początkowy DBD i również deklaruje się jako Master.
-                    is_initial_dbd = (
-                        i_bit
-                        and m_bit
-                        and ms_bit
-                        and pkt_len == 28
-                        and local_router_id > router_id
-                    )
-
-                    if is_initial_dbd:
-
-                        # Sąsiad rozpoczął ExStart ponownie po wcześniejszej
-                        # negocjacji lub zakończonym Exchange.
-                        if (
-                            self.dbd_negotiated
-                            or self.dbd_exchange_complete
-                        ):
-                            self.reset_dbd_state(
-                                "neighbor restarted ExStart"
-                            )
-
-                        self.logger.info(
-                            "[OSPF][DBD] ExStart "
-                            "local=%s peer=%s role=Master",
-                            OSPF_ROUTER_ID,
-                            router_id_text
-                        )
-
-                        self.send_initial_dbd()
-
-                    elif (
-                        not self.dbd_negotiated
-                        and not i_bit
-                        and not ms_bit
-                        and dd_sequence == self.dbd_sequence
-                        and local_router_id > router_id
-                    ):
-                        self.logger.info(
-                            "[OSPF][DBD] negotiation-complete "
-                            "role=Master seq=0x%08x",
-                            dd_sequence
-                        )
-
-                        self.dbd_negotiated = True
-
-                        self.lsa_request_list = list(lsa_headers)
-
-                        self.logger.info(
-                            "[OSPF][DBD] request-list=%d",
-                            len(self.lsa_request_list)
-                        )
-
-                        self.dbd_sequence = (
-                            self.dbd_sequence + 1
-                        ) & 0xffffffff
-
-                        self.send_exchange_dbd()
-
-                    elif (
-                        self.dbd_negotiated
-                        and not self.dbd_exchange_complete
-                        and not i_bit
-                        and not m_bit
-                        and not ms_bit
-                        and dd_sequence == self.dbd_sequence
-                    ):
-                        self.dbd_exchange_complete = True
-
-                        self.logger.info(
-                            "[OSPF][DBD] exchange-complete seq=0x%08x pending=%d",
-                            dd_sequence,
-                            len(self.lsa_request_list)
-                        )
-
-                        if (
-                            self.lsa_request_list
-                            and not self.lsr_sent
-                        ):
-                            self.send_link_state_request()
+                    
                 elif version == 3 and pkt_type == 4 and pkt_len >= 20:
-
                     number_of_lsas = struct.unpack(
                         "!I",
                         ospf_data[16:20]
