@@ -41,6 +41,7 @@ OSPF_MAX_AGE = 3600
 OSPF_MAX_AGE_DIFF = 900
 
 OSPF_INITIAL_SEQUENCE = 0x80000001
+OSPF_INTERFACE_COST = 10
 
 def build_ospfv3_hello(neighbors=()):
     version = 3
@@ -1759,6 +1760,129 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.log_spf_result()
         self.log_ipv6_routing_table()
 
+    def get_ospf_neighbor_interface_id(self):
+        """
+        Returns the Interface ID used by the OSPF neighbor
+        on the point-to-point link toward this SDN router.
+        """
+
+        if self.ospf_neighbor_router_id is None:
+            return None
+
+        local_interface_id_text = socket.inet_ntoa(
+            struct.pack("!I", OSPF_INTERFACE_ID)
+        )
+
+        for lsa in self.lsdb.values():
+            if lsa["ls_type"] != 0x2001:
+                continue
+
+            if lsa["advertising_router"] != self.ospf_neighbor_router_id:
+                continue
+
+            router_lsa = lsa.get("router_lsa")
+
+            if router_lsa is None:
+                continue
+
+            for link in router_lsa["links"]:
+                if link["type"] != 1:
+                    continue
+
+                if link["neighbor_router_id"] != OSPF_ROUTER_ID:
+                    continue
+
+                if link["neighbor_interface_id"] != local_interface_id_text:
+                    continue
+
+                # Stored in the parser as dotted-decimal text,
+                # e.g. "0.0.0.39". Convert it back to uint32
+                # for struct.pack() when building our own LSA.
+                return struct.unpack(
+                    "!I",
+                    socket.inet_aton(link["interface_id"])
+                )[0]
+
+        return None
+
+    def build_local_router_lsa(self):
+        """
+        Builds the locally originated OSPFv3 Router-LSA.
+
+        The LSA describes the point-to-point link:
+            Ryu -> OSPF neighbor (R1)
+
+        This function only builds and returns the LSA.
+        It does not transmit it.
+        """
+
+        if self.ospf_neighbor_router_id is None:
+            self.logger.warning(
+                "[OSPF][LOCAL LSA] cannot build Router-LSA: "
+                "neighbor Router ID is unknown"
+            )
+            return None
+
+        neighbor_interface_id = self.get_ospf_neighbor_interface_id()
+
+        if neighbor_interface_id is None:
+            self.logger.warning(
+                "[OSPF][LOCAL LSA] cannot build Router-LSA: "
+                "neighbor Interface ID is unknown"
+            )
+            return None
+
+        advertising_router = struct.unpack(
+            "!I",
+            socket.inet_aton(OSPF_ROUTER_ID)
+        )[0]
+
+        neighbor_router_id = struct.unpack(
+            "!I",
+            socket.inet_aton(self.ospf_neighbor_router_id)
+        )[0]
+
+        # Router-LSA body:
+        #
+        #   1 byte  Bits
+        #   3 bytes Options
+        #   16 bytes point-to-point link description
+
+        bits = 0
+
+        router_lsa_body = (
+            struct.pack("!B", bits)
+            + OSPF_OPTIONS.to_bytes(3, byteorder="big")
+            + struct.pack(
+                "!BBHIII",
+                1,                          # Type: Point-to-Point
+                0,                          # Reserved
+                OSPF_INTERFACE_COST,        # Metric
+                OSPF_INTERFACE_ID,          # Local Interface ID
+                neighbor_interface_id,      # Neighbor Interface ID
+                neighbor_router_id          # Neighbor Router ID
+            )
+        )
+
+        lsa_length = 20 + len(router_lsa_body)
+
+        lsa_header = struct.pack(
+            "!HHIIIHH",
+            0,                              # LS Age
+            0x2001,                         # Router-LSA, Area Scope
+            0,                              # Link State ID = 0.0.0.0
+            advertising_router,
+            self.local_router_lsa_sequence,
+            0,                              # Checksum filled later
+            lsa_length
+        )
+
+        lsa = lsa_header + router_lsa_body
+
+        lsa = finalize_ospfv3_lsa_checksum(lsa)
+
+        return lsa
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
@@ -2150,6 +2274,57 @@ class OSPFv3Controller(app_manager.RyuApp):
                 route["interface"]
             )
 
+    def log_local_router_lsa(self):
+        lsa = self.build_local_router_lsa()
+
+        if lsa is None:
+            return
+
+        (
+            ls_age,
+            ls_type,
+            link_state_id,
+            advertising_router,
+            sequence,
+            checksum,
+            length
+        ) = struct.unpack(
+            "!HHIIIHH",
+            lsa[:20]
+        )
+
+        (
+            link_type,
+            reserved,
+            metric,
+            interface_id,
+            neighbor_interface_id,
+            neighbor_router_id
+        ) = struct.unpack(
+            "!BBHIII",
+            lsa[24:40]
+        )
+
+        self.logger.info(
+            "[OSPF][LOCAL ROUTER-LSA] "
+            "adv=%s lsid=%s seq=0x%08x checksum=0x%04x "
+            "length=%d",
+            socket.inet_ntoa(struct.pack("!I", advertising_router)),
+            socket.inet_ntoa(struct.pack("!I", link_state_id)),
+            sequence,
+            checksum,
+            length
+        )
+
+        self.logger.info(
+            "  -> router=%s cost=%d "
+            "if=%s neighbor_if=%s",
+            socket.inet_ntoa(struct.pack("!I", neighbor_router_id)),
+            metric,
+            socket.inet_ntoa(struct.pack("!I", interface_id)),
+            socket.inet_ntoa(struct.pack("!I", neighbor_interface_id))
+        )
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -2510,20 +2685,6 @@ class OSPFv3Controller(app_manager.RyuApp):
                             ospf_data[offset:offset + ls_length]
                         )
 
-                        calculated_lsa_checksum = ospfv3_lsa_checksum(
-                            raw_lsa
-                        )
-
-                        self.logger.info(
-                            "[OSPF][LSA CHECKSUM] "
-                            "type=%s received=0x%04x "
-                            "calculated=0x%04x valid=%s",
-                            ospfv3_lsa_type_description(ls_type),
-                            ls_checksum,
-                            calculated_lsa_checksum,
-                            ls_checksum == calculated_lsa_checksum
-                        )
-
                         lsa_header = {
                             "ls_age": ls_age,
                             "ls_type": ls_type,
@@ -2607,4 +2768,13 @@ class OSPFv3Controller(app_manager.RyuApp):
                     if lsu_lsa_headers:
                         self.update_lsa_request_list(lsu_lsa_headers)
                         self.update_lsdb(lsu_lsa_headers)
+
+                        for lsa in lsu_lsa_headers:
+                            if (
+                                lsa["ls_type"] == 0x2001
+                                and lsa["advertising_router"] == self.ospf_neighbor_router_id
+                            ):
+                                self.log_local_router_lsa()
+                                break
+
                         self.send_ls_ack(lsu_lsa_headers)
