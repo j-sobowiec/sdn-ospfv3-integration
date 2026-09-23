@@ -1964,6 +1964,86 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         return lsa
 
+    def build_local_link_lsa(self):
+        """
+        Builds the locally originated OSPFv3 Link-LSA
+        for the point-to-point link toward R1.
+        """
+
+        advertising_router = struct.unpack(
+            "!I",
+            socket.inet_aton(OSPF_ROUTER_ID)
+        )[0]
+
+        link_local_address = socket.inet_pton(
+            socket.AF_INET6,
+            SDN_LINK_LOCAL
+        )
+
+        transit_network = ipaddress.IPv6Network(
+            f"{SDN_TRANSIT_PREFIX}/{SDN_TRANSIT_PREFIX_LENGTH}",
+            strict=False
+        )
+
+        prefix_bytes_length = (
+            SDN_TRANSIT_PREFIX_LENGTH + 7
+        ) // 8
+
+        prefix_bytes = transit_network.network_address.packed[
+            :prefix_bytes_length
+        ]
+
+        padding_length = (-len(prefix_bytes)) % 4
+        prefix_bytes += b"\x00" * padding_length
+
+        # Link-LSA prefix entry:
+        #
+        #   1 byte  Prefix Length
+        #   1 byte  Prefix Options
+        #   2 bytes Reserved
+        #   variable-length Address Prefix
+        prefix_entry = struct.pack(
+            "!BBH",
+            SDN_TRANSIT_PREFIX_LENGTH,
+            0,      # Prefix Options
+            0       # Reserved
+        ) + prefix_bytes
+
+        # Link-LSA body:
+        #
+        #   1 byte   Router Priority
+        #   3 bytes  Options
+        #   16 bytes Link-local Interface Address
+        #   4 bytes  Number of Prefixes
+        #   prefix entries...
+        lsa_body = (
+            struct.pack(
+                "!B",
+                OSPF_ROUTER_PRIORITY
+            )
+            + OSPF_OPTIONS.to_bytes(3, byteorder="big")
+            + link_local_address
+            + struct.pack("!I", 1)
+            + prefix_entry
+        )
+
+        lsa_length = 20 + len(lsa_body)
+
+        lsa_header = struct.pack(
+            "!HHIIIHH",
+            0,                          # LS Age
+            0x0008,                     # Link-LSA
+            OSPF_INTERFACE_ID,           # Link State ID = local Interface ID
+            advertising_router,
+            self.local_link_lsa_sequence,
+            0,                          # Checksum filled later
+            lsa_length
+        )
+
+        lsa = lsa_header + lsa_body
+
+        return finalize_ospfv3_lsa_checksum(lsa)
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
@@ -2478,6 +2558,87 @@ class OSPFv3Controller(app_manager.RyuApp):
             metric
         )
 
+    def log_local_link_lsa(self):
+        lsa = self.build_local_link_lsa()
+
+        (
+            ls_age,
+            ls_type,
+            link_state_id,
+            advertising_router,
+            sequence,
+            checksum,
+            length
+        ) = struct.unpack(
+            "!HHIIIHH",
+            lsa[:20]
+        )
+
+        router_priority = lsa[20]
+        options = int.from_bytes(
+            lsa[21:24],
+            byteorder="big"
+        )
+
+        link_local = socket.inet_ntop(
+            socket.AF_INET6,
+            lsa[24:40]
+        )
+
+        prefix_count = struct.unpack(
+            "!I",
+            lsa[40:44]
+        )[0]
+
+        prefix_length, prefix_options, reserved = struct.unpack(
+            "!BBH",
+            lsa[44:48]
+        )
+
+        prefix_bytes_length = (prefix_length + 7) // 8
+
+        prefix_raw = lsa[
+            48:48 + prefix_bytes_length
+        ]
+
+        full_prefix = prefix_raw + (
+            b"\x00" * (16 - len(prefix_raw))
+        )
+
+        prefix_text = socket.inet_ntop(
+            socket.AF_INET6,
+            full_prefix
+        )
+
+        self.logger.info(
+            "[OSPF][LOCAL LINK-LSA] "
+            "adv=%s lsid=%s seq=0x%08x "
+            "checksum=0x%04x length=%d",
+            socket.inet_ntoa(
+                struct.pack("!I", advertising_router)
+            ),
+            socket.inet_ntoa(
+                struct.pack("!I", link_state_id)
+            ),
+            sequence,
+            checksum,
+            length
+        )
+
+        self.logger.info(
+            "  link-local=%s priority=%d "
+            "options=0x%06x prefixes=%d",
+            link_local,
+            router_priority,
+            options,
+            prefix_count
+        )
+
+        self.logger.info(
+            "  -> %s/%d",
+            prefix_text,
+            prefix_length
+        )
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -2927,8 +3088,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 lsa["ls_type"] == 0x2001
                                 and lsa["advertising_router"] == self.ospf_neighbor_router_id
                             ):
-                                self.log_local_router_lsa()
-                                self.log_local_intra_area_prefix_lsa()
+                                self.log_local_link_lsa()
                                 break
 
                         self.send_ls_ack(lsu_lsa_headers)
