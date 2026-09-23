@@ -217,50 +217,18 @@ def mac_to_bytes(mac):
         for part in mac.split(":")
     )
 
-def build_ospfv3_hello_frame(neighbors=()):
-    ospf_packet = build_ospfv3_hello(neighbors)
-
-    # Ethernet
-    eth_dst = mac_to_bytes("33:33:00:00:00:05")
-    eth_src = mac_to_bytes(SDN_MAC)
-
-    ethernet_header = struct.pack(
-        "!6s6sH",
-        eth_dst,
-        eth_src,
-        0x86DD       # EtherType IPv6
-    )
-
-    # IPv6
-    version_tc_flow = 6 << 28
-
-    ipv6_header = struct.pack(
-        "!IHBB16s16s",
-        version_tc_flow,
-        len(ospf_packet),  
-        89,                 # Next Header = OSPF
-        1,                  # Hop Limit
-        socket.inet_pton(
-            socket.AF_INET6,
-            SDN_LINK_LOCAL
-        ),
-        socket.inet_pton(
-            socket.AF_INET6,
-            "ff02::5"
-        )
-    )
-
-    return ethernet_header + ipv6_header + ospf_packet
-
-def build_ospfv3_dbd_frame(dd_sequence, flags=0x07):
-    ospf_packet = build_ospfv3_dbd(
-        dd_sequence,
-        flags
-    )
+def build_ospfv3_frame(
+    ospf_packet,
+    dst_ipv6,
+    dst_mac
+):
+    """
+    Builds an Ethernet + IPv6 frame carrying an OSPFv3 packet.
+    """
 
     ethernet_header = struct.pack(
         "!6s6sH",
-        mac_to_bytes("33:33:00:00:00:05"),
+        mac_to_bytes(dst_mac),
         mac_to_bytes(SDN_MAC),
         0x86DD
     )
@@ -269,19 +237,42 @@ def build_ospfv3_dbd_frame(dd_sequence, flags=0x07):
         "!IHBB16s16s",
         6 << 28,
         len(ospf_packet),
-        89,
-        1,
+        89,     # Next Header = OSPF
+        1,      # Hop Limit
         socket.inet_pton(
             socket.AF_INET6,
             SDN_LINK_LOCAL
         ),
         socket.inet_pton(
             socket.AF_INET6,
-            "ff02::5"
+            dst_ipv6
         )
     )
 
     return ethernet_header + ipv6_header + ospf_packet
+
+def build_ospfv3_hello_frame(neighbors=()):
+    ospf_packet = build_ospfv3_hello(
+        neighbors
+    )
+
+    return build_ospfv3_frame(
+        ospf_packet=ospf_packet,
+        dst_ipv6="ff02::5",
+        dst_mac="33:33:00:00:00:05"
+    )
+
+def build_ospfv3_dbd_frame(dd_sequence, flags=0x07):
+    ospf_packet = build_ospfv3_dbd(
+        dd_sequence,
+        flags
+    )
+
+    return build_ospfv3_frame(
+        ospf_packet=ospf_packet,
+        dst_ipv6="ff02::5",
+        dst_mac="33:33:00:00:00:05"
+    )
 
 def build_ospfv3_lsr_frame(
     lsa_requests,
@@ -293,30 +284,11 @@ def build_ospfv3_lsr_frame(
         dst_ipv6
     )
 
-    ethernet_header = struct.pack(
-        "!6s6sH",
-        mac_to_bytes(dst_mac),
-        mac_to_bytes(SDN_MAC),
-        0x86DD
+    return build_ospfv3_frame(
+        ospf_packet=ospf_packet,
+        dst_ipv6=dst_ipv6,
+        dst_mac=dst_mac
     )
-
-    ipv6_header = struct.pack(
-        "!IHBB16s16s",
-        6 << 28,
-        len(ospf_packet),
-        89,
-        1,
-        socket.inet_pton(
-            socket.AF_INET6,
-            SDN_LINK_LOCAL
-        ),
-        socket.inet_pton(
-            socket.AF_INET6,
-            dst_ipv6
-        )
-    )
-
-    return ethernet_header + ipv6_header + ospf_packet
 
 def build_ospfv3_lsack_frame(
     lsa_headers,
@@ -328,30 +300,11 @@ def build_ospfv3_lsack_frame(
         dst_ipv6
     )
 
-    ethernet_header = struct.pack(
-        "!6s6sH",
-        mac_to_bytes(dst_mac),
-        mac_to_bytes(SDN_MAC),
-        0x86DD
+    return build_ospfv3_frame(
+        ospf_packet=ospf_packet,
+        dst_ipv6=dst_ipv6,
+        dst_mac=dst_mac
     )
-
-    ipv6_header = struct.pack(
-        "!IHBB16s16s",
-        6 << 28,
-        len(ospf_packet),
-        89,
-        1,
-        socket.inet_pton(
-            socket.AF_INET6,
-            SDN_LINK_LOCAL
-        ),
-        socket.inet_pton(
-            socket.AF_INET6,
-            dst_ipv6
-        )
-    )
-
-    return ethernet_header + ipv6_header + ospf_packet
 
 def ospfv3_lsa_type_description(ls_type):
     """Zwróć czytelną nazwę typu LSA oraz jego flooding scope."""
