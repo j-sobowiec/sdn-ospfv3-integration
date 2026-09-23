@@ -43,6 +43,8 @@ OSPF_MAX_AGE_DIFF = 900
 OSPF_INITIAL_SEQUENCE = 0x80000001
 OSPF_INTERFACE_COST = 10
 
+OSPF_LAN_PREFIX_METRIC = 10
+
 def build_ospfv3_hello(neighbors=()):
     version = 3
     pkt_type = 1
@@ -1883,6 +1885,85 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         return lsa
 
+    def build_local_intra_area_prefix_lsa(self):
+        """
+        Builds the locally originated OSPFv3 Intra-Area-Prefix-LSA.
+
+        The LSA advertises the SDN LAN:
+            2001:db8:1::/64
+
+        and references the local Router-LSA.
+        """
+
+        advertising_router = struct.unpack(
+            "!I",
+            socket.inet_aton(OSPF_ROUTER_ID)
+        )[0]
+
+        prefix_network = ipaddress.IPv6Network(
+            f"{SDN_LAN_PREFIX}/{SDN_LAN_PREFIX_LENGTH}",
+            strict=False
+        )
+
+        # For a /64 prefix, OSPF carries the first 8 bytes
+        # of the IPv6 network address.
+        prefix_bytes_length = (SDN_LAN_PREFIX_LENGTH + 7) // 8
+
+        prefix_bytes = prefix_network.network_address.packed[
+            :prefix_bytes_length
+        ]
+
+        # OSPFv3 prefix representation must end on a 32-bit boundary.
+        padding_length = (-len(prefix_bytes)) % 4
+        prefix_bytes += b"\x00" * padding_length
+
+        # Prefix entry:
+        #
+        #   2 bytes Metric
+        #   1 byte  Prefix Length
+        #   1 byte  Prefix Options
+        #   variable-length IPv6 prefix
+        prefix_entry = struct.pack(
+            "!BBH",
+            SDN_LAN_PREFIX_LENGTH,
+            0,                          # Prefix Options
+            OSPF_LAN_PREFIX_METRIC
+        ) + prefix_bytes
+
+        # Intra-Area-Prefix-LSA body:
+        #
+        #   2 bytes Number of Prefixes
+        #   2 bytes Referenced LS Type
+        #   4 bytes Referenced Link State ID
+        #   4 bytes Referenced Advertising Router
+        #   prefix entries...
+        lsa_body = struct.pack(
+            "!HHII",
+            1,                          # Number of prefixes
+            0x2001,                     # Referenced Router-LSA
+            0,                          # Referenced LSID = 0.0.0.0
+            advertising_router
+        ) + prefix_entry
+
+        lsa_length = 20 + len(lsa_body)
+
+        lsa_header = struct.pack(
+            "!HHIIIHH",
+            0,                              # LS Age
+            0x2009,                         # Intra-Area-Prefix-LSA
+            0,                              # Link State ID = 0.0.0.0
+            advertising_router,
+            self.local_prefix_lsa_sequence,
+            0,                              # Checksum filled later
+            lsa_length
+        )
+
+        lsa = lsa_header + lsa_body
+
+        lsa = finalize_ospfv3_lsa_checksum(lsa)
+
+        return lsa
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
@@ -2323,6 +2404,78 @@ class OSPFv3Controller(app_manager.RyuApp):
             metric,
             socket.inet_ntoa(struct.pack("!I", interface_id)),
             socket.inet_ntoa(struct.pack("!I", neighbor_interface_id))
+        )
+
+    def log_local_intra_area_prefix_lsa(self):
+        lsa = self.build_local_intra_area_prefix_lsa()
+
+        if lsa is None:
+            return
+
+        (
+            ls_age,
+            ls_type,
+            link_state_id,
+            advertising_router,
+            sequence,
+            checksum,
+            length
+        ) = struct.unpack(
+            "!HHIIIHH",
+            lsa[:20]
+        )
+
+        (
+            prefix_count,
+            referenced_ls_type,
+            referenced_lsid,
+            referenced_advertising_router
+        ) = struct.unpack(
+            "!HHII",
+            lsa[20:32]
+        )
+
+        prefix_length, prefix_options, metric = struct.unpack(
+            "!BBH",
+            lsa[32:36]
+        )
+
+        prefix_bytes_length = (prefix_length + 7) // 8
+
+        prefix_raw = lsa[
+            36:36 + prefix_bytes_length
+        ]
+
+        full_prefix = prefix_raw + (
+            b"\x00" * (16 - len(prefix_raw))
+        )
+
+        prefix_text = socket.inet_ntop(
+            socket.AF_INET6,
+            full_prefix
+        )
+
+        self.logger.info(
+            "[OSPF][LOCAL INTRA-PREFIX-LSA] "
+            "adv=%s lsid=%s seq=0x%08x checksum=0x%04x "
+            "length=%d prefixes=%d",
+            socket.inet_ntoa(struct.pack("!I", advertising_router)),
+            socket.inet_ntoa(struct.pack("!I", link_state_id)),
+            sequence,
+            checksum,
+            length,
+            prefix_count
+        )
+
+        self.logger.info(
+            "  referenced=Router-LSA router=%s "
+            "prefix=%s/%d cost=%d",
+            socket.inet_ntoa(
+                struct.pack("!I", referenced_advertising_router)
+            ),
+            prefix_text,
+            prefix_length,
+            metric
         )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -2775,6 +2928,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                                 and lsa["advertising_router"] == self.ospf_neighbor_router_id
                             ):
                                 self.log_local_router_lsa()
+                                self.log_local_intra_area_prefix_lsa()
                                 break
 
                         self.send_ls_ack(lsu_lsa_headers)
