@@ -2284,7 +2284,103 @@ class OSPFv3Controller(app_manager.RyuApp):
                 route["next_hop"],
                 route["interface"]
             )
-    
+
+    def handle_ospf_hello(
+        self,
+        in_port,
+        eth_pkt,
+        ipv6_pkt,
+        ospf_data,
+        pkt_len,
+        router_id_text,
+        area_id_text
+    ):
+        """
+        Handles a received OSPFv3 Hello packet.
+        """
+
+        hello_data = ospf_data[16:36]
+
+        (
+            interface_id,
+            router_priority,
+            options_raw,
+            hello_interval,
+            dead_interval,
+            designated_router,
+            backup_designated_router
+        ) = struct.unpack(
+            "!IB3sHHII",
+            hello_data
+        )
+
+        options = int.from_bytes(
+            options_raw,
+            byteorder="big"
+        )
+
+        neighbors = []
+
+        neighbor_data = ospf_data[36:pkt_len]
+
+        if len(neighbor_data) % 4 != 0:
+            self.logger.warning(
+                "[OSPF][HELLO] invalid neighbor-list length=%d",
+                len(neighbor_data)
+            )
+            return
+
+        for offset in range(
+            0,
+            len(neighbor_data),
+            4
+        ):
+            neighbor_id = struct.unpack(
+                "!I",
+                neighbor_data[offset:offset + 4]
+            )[0]
+
+            neighbors.append(
+                socket.inet_ntoa(
+                    struct.pack(
+                        "!I",
+                        neighbor_id
+                    )
+                )
+            )
+
+        self.ospf_port = in_port
+        self.ospf_neighbor_ipv6 = ipv6_pkt.src
+        self.ospf_neighbor_mac = eth_pkt.src
+        self.ospf_neighbor_router_id = router_id_text
+
+        if router_id_text not in self.ospf_neighbors:
+            self.ospf_neighbors.append(
+                router_id_text
+            )
+
+            self.logger.info(
+                "[OSPF][NEIGHBOR] discovered router=%s src=%s",
+                router_id_text,
+                ipv6_pkt.src
+            )
+
+            self.send_ospfv3_hello()
+
+        self.log_hello(
+            in_port,
+            ipv6_pkt,
+            pkt_len,
+            router_id_text,
+            area_id_text,
+            interface_id,
+            router_priority,
+            options,
+            hello_interval,
+            dead_interval,
+            neighbors
+        )
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -2345,73 +2441,14 @@ class OSPFv3Controller(app_manager.RyuApp):
 
                 if version == 3 and pkt_type == 1 and pkt_len >= 36:
 
-                    hello_data = ospf_data[16:36]
-
-                    (
-                        interface_id,
-                        router_priority,
-                        options_raw,
-                        hello_interval,
-                        dead_interval,
-                        designated_router,
-                        backup_designated_router
-                    ) = struct.unpack("!IB3sHHII", hello_data)
-
-                    options = int.from_bytes(options_raw, byteorder="big")
-
-                    neighbors = []
-
-                    neighbor_data = ospf_data[36:pkt_len]
-
-                    if len(neighbor_data) % 4 != 0:
-                        self.logger.warning(
-                            "[OSPF][HELLO] invalid neighbor-list length=%d",
-                            len(neighbor_data)
-                        )
-                        return
-
-                    for offset in range(0, len(neighbor_data), 4):
-                        if offset + 4 <= len(neighbor_data):
-                            neighbor_id = struct.unpack(
-                                "!I",
-                                neighbor_data[offset:offset + 4]
-                            )[0]
-
-                            neighbors.append(
-                                socket.inet_ntoa(
-                                    struct.pack("!I", neighbor_id)
-                                )
-                            )
-
-
-                    self.ospf_port = in_port
-                    self.ospf_neighbor_ipv6 = ipv6_pkt.src
-                    self.ospf_neighbor_mac = eth_pkt.src
-                    self.ospf_neighbor_router_id = router_id_text
-
-                    if router_id_text not in self.ospf_neighbors:
-                        self.ospf_neighbors.append(router_id_text)
-
-                        self.logger.info(
-                            "[OSPF][NEIGHBOR] discovered router=%s src=%s",
-                            router_id_text,
-                            ipv6_pkt.src
-                        )
-
-                        self.send_ospfv3_hello()
-
-                    self.log_hello(
+                    self.handle_ospf_hello(
                         in_port,
+                        eth_pkt,
                         ipv6_pkt,
+                        ospf_data,
                         pkt_len,
                         router_id_text,
-                        area_id_text,
-                        interface_id,
-                        router_priority,
-                        options,
-                        hello_interval,
-                        dead_interval,
-                        neighbors
+                        area_id_text
                     )
 
                 elif version == 3 and pkt_type == 2 and pkt_len >= 28:
