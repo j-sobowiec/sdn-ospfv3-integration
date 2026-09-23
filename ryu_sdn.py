@@ -838,6 +838,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.lsdb = {}
         self.ipv6_routing_table = {}
         self.local_lsas = {}
+        self.local_lsu_sent = False
 
         self.local_router_lsa_sequence = OSPF_INITIAL_SEQUENCE
         self.local_prefix_lsa_sequence = OSPF_INITIAL_SEQUENCE
@@ -1443,6 +1444,15 @@ class OSPFv3Controller(app_manager.RyuApp):
             self.send_ls_ack(
                 lsu_lsa_headers
             )
+
+            if (
+                self.local_lsas
+                and self.dbd_exchange_complete
+                and not self.lsa_request_list
+                and not self.local_lsu_sent
+            ):
+                if self.send_local_ls_update():
+                    self.local_lsu_sent = True
 
     def send_frame(self, frame, out_port):
         """
@@ -2613,7 +2623,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                 len(lsu_packet),
                 lsu_checksum
             )
-            
+
         if (
             self.ospf_neighbor_ipv6 is not None
             and self.ospf_neighbor_mac is not None
@@ -2655,6 +2665,47 @@ class OSPFv3Controller(app_manager.RyuApp):
             )
             + b"".join(lsa_bytes)
         )
+
+    def send_local_ls_update(self):
+        """
+        Sends all locally originated LSAs to the OSPF neighbor
+        in a single Link State Update packet.
+        """
+
+        if self.ospf_port is None:
+            return False
+
+        if self.ospf_neighbor_ipv6 is None:
+            return False
+
+        if self.ospf_neighbor_mac is None:
+            return False
+
+        lsu_body = self.build_local_ls_update_body()
+
+        if lsu_body is None:
+            return False
+
+        frame = build_ospfv3_lsu_frame(
+            lsu_body,
+            self.ospf_neighbor_ipv6,
+            self.ospf_neighbor_mac
+        )
+
+        if not self.send_frame(
+            frame,
+            self.ospf_port
+        ):
+            return False
+
+        self.logger.info(
+            "[OSPF][LSU TX] to=%s lsas=%d frame-length=%d",
+            self.ospf_neighbor_ipv6,
+            len(self.local_lsas),
+            len(frame)
+        )
+
+        return True
 
     def log_hello(
         self,
