@@ -2564,6 +2564,193 @@ class OSPFv3Controller(app_manager.RyuApp):
             ):
                 self.send_link_state_request()
 
+    def handle_ospf_lsu(
+        self,
+        in_port,
+        ipv6_pkt,
+        ospf_data,
+        pkt_len,
+        router_id_text,
+        area_id_text
+    ):
+        """
+        Handles a received OSPFv3 Link State Update packet.
+        """
+
+        number_of_lsas = struct.unpack(
+            "!I",
+            ospf_data[16:20]
+        )[0]
+
+        lsu_lsa_headers = []
+
+        # 16 B OSPFv3 header
+        #  4 B number of LSAs
+        # --------------------
+        # 20 B first LSA offset
+        offset = 20
+
+        for index in range(number_of_lsas):
+
+            if offset + 20 > pkt_len:
+                self.logger.warning(
+                    "[OSPF][LSU] insufficient data for LSA header #%d",
+                    index + 1
+                )
+                return
+
+            raw_lsa_header = bytes(
+                ospf_data[offset:offset + 20]
+            )
+
+            (
+                ls_age,
+                ls_type,
+                link_state_id,
+                advertising_router,
+                ls_sequence,
+                ls_checksum,
+                ls_length
+            ) = struct.unpack(
+                "!HHIIIHH",
+                raw_lsa_header
+            )
+
+            if ls_length < 20:
+                self.logger.warning(
+                    "[OSPF][LSU] invalid LSA length #%d: %d",
+                    index + 1,
+                    ls_length
+                )
+                return
+
+            if offset + ls_length > pkt_len:
+                self.logger.warning(
+                    "[OSPF][LSU] LSA #%d exceeds packet boundary "
+                    "(offset=%d length=%d packet=%d)",
+                    index + 1,
+                    offset,
+                    ls_length,
+                    pkt_len
+                )
+                return
+
+            raw_lsa = bytes(
+                ospf_data[offset:offset + ls_length]
+            )
+
+            lsa_header = {
+                "ls_age": ls_age,
+                "ls_type": ls_type,
+
+                "link_state_id": socket.inet_ntoa(
+                    struct.pack(
+                        "!I",
+                        link_state_id
+                    )
+                ),
+
+                "advertising_router": socket.inet_ntoa(
+                    struct.pack(
+                        "!I",
+                        advertising_router
+                    )
+                ),
+
+                "ls_sequence": ls_sequence,
+                "ls_checksum": ls_checksum,
+                "ls_length": ls_length,
+
+                # Used when generating LSAck.
+                "raw_header": raw_lsa_header
+            }
+
+            if ls_type == 0x2001:
+                try:
+                    lsa_header["router_lsa"] = (
+                        parse_ospfv3_router_lsa(
+                            raw_lsa
+                        )
+                    )
+                except ValueError as exc:
+                    self.logger.warning(
+                        "[OSPF][LSU] Router-LSA parse error #%d: %s",
+                        index + 1,
+                        exc
+                    )
+                    return
+
+            elif ls_type == 0x0008:
+                try:
+                    lsa_header["link_lsa"] = (
+                        parse_ospfv3_link_lsa(
+                            raw_lsa
+                        )
+                    )
+                except ValueError as exc:
+                    self.logger.warning(
+                        "[OSPF][LSU] Link-LSA parse error #%d: %s",
+                        index + 1,
+                        exc
+                    )
+                    return
+
+            elif ls_type == 0x2009:
+                try:
+                    lsa_header["intra_area_prefix_lsa"] = (
+                        parse_ospfv3_intra_area_prefix_lsa(
+                            raw_lsa
+                        )
+                    )
+                except ValueError as exc:
+                    self.logger.warning(
+                        "[OSPF][LSU] "
+                        "Intra-Area-Prefix-LSA parse error #%d: %s",
+                        index + 1,
+                        exc
+                    )
+                    return
+
+            lsu_lsa_headers.append(
+                lsa_header
+            )
+
+            offset += ls_length
+
+        if offset != pkt_len:
+            self.logger.warning(
+                "[OSPF][LSU] length mismatch "
+                "parsed=%d packet=%d",
+                offset,
+                pkt_len
+            )
+            return
+
+        self.log_lsu(
+            in_port,
+            ipv6_pkt,
+            pkt_len,
+            router_id_text,
+            area_id_text,
+            lsu_lsa_headers
+        )
+
+        if lsu_lsa_headers:
+            self.update_lsa_request_list(
+                lsu_lsa_headers
+            )
+
+            self.update_lsdb(
+                lsu_lsa_headers
+            )
+
+            if not self.local_lsas:
+                self.initialize_local_lsas()
+
+            self.send_ls_ack(
+                lsu_lsa_headers
+            )
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -2647,155 +2834,11 @@ class OSPFv3Controller(app_manager.RyuApp):
                     )
                     
                 elif version == 3 and pkt_type == 4 and pkt_len >= 20:
-                    number_of_lsas = struct.unpack(
-                        "!I",
-                        ospf_data[16:20]
-                    )[0]
-
-                    lsu_lsa_headers = []
-
-                    # 16 B = OSPFv3 header
-                    #  4 B = liczba LSA
-                    # ------------------
-                    # 20 B = poczatek pierwszego LSA
-                    offset = 20
-
-                    for index in range(number_of_lsas):
-
-                        # Każde LSA musi mieć przynajmniej 20-bajtowy nagłówek.
-                        if offset + 20 > pkt_len:
-                            self.logger.warning(
-                                "[OSPF][LSU] insufficient data for LSA header #%d",
-                                index + 1
-                            )
-                            return
-
-                        raw_lsa_header = bytes(
-                            ospf_data[offset:offset + 20]
-                        )
-
-                        (
-                            ls_age,
-                            ls_type,
-                            link_state_id,
-                            advertising_router,
-                            ls_sequence,
-                            ls_checksum,
-                            ls_length
-                        ) = struct.unpack(
-                            "!HHIIIHH",
-                            raw_lsa_header
-                        )
-
-                        # Dlugosc LSA zawiera jego 20-bajtowy naglowek.
-                        if ls_length < 20:
-                            self.logger.warning(
-                                "[OSPF][LSU] invalid LSA length #%d: %d",
-                                index + 1,
-                                ls_length
-                            )
-                            return
-
-                        if offset + ls_length > pkt_len:
-                            self.logger.warning(
-                                "[OSPF][LSU] LSA #%d exceeds packet boundary "
-                                "(offset=%d length=%d packet=%d)",
-                                index + 1,
-                                offset,
-                                ls_length,
-                                pkt_len
-                            )
-                            return
-                        
-                        raw_lsa = bytes(
-                            ospf_data[offset:offset + ls_length]
-                        )
-
-                        lsa_header = {
-                            "ls_age": ls_age,
-                            "ls_type": ls_type,
-                            "link_state_id": socket.inet_ntoa(
-                                struct.pack("!I", link_state_id)
-                            ),
-                            "advertising_router": socket.inet_ntoa(
-                                struct.pack("!I", advertising_router)
-                            ),
-                            "ls_sequence": ls_sequence,
-                            "ls_checksum": ls_checksum,
-                            "ls_length": ls_length,
-
-                            # Przyda się za chwilę do LSAck.
-                            "raw_header": raw_lsa_header
-                        }
-
-                        if ls_type == 0x2001:
-                            try:
-                                lsa_header["router_lsa"] = (
-                                    parse_ospfv3_router_lsa(raw_lsa)
-                                )
-                            except ValueError as exc:
-                                self.logger.warning(
-                                    "[OSPF][LSU] Router-LSA parse error #%d: %s",
-                                    index + 1,
-                                    exc
-                                )
-                                return
-                            
-                        elif ls_type == 0x0008:
-                            try:
-                                lsa_header["link_lsa"] = (
-                                    parse_ospfv3_link_lsa(raw_lsa)
-                                )
-                            except ValueError as exc:
-                                self.logger.warning(
-                                    "[OSPF][LSU] Link-LSA parse error #%d: %s",
-                                    index + 1,
-                                    exc
-                                )
-                                return
-                            
-                        elif ls_type == 0x2009:
-                            try:
-                                lsa_header["intra_area_prefix_lsa"] = (
-                                    parse_ospfv3_intra_area_prefix_lsa(
-                                        raw_lsa
-                                    )
-                                )
-                            except ValueError as exc:
-                                self.logger.warning(
-                                    "[OSPF][LSU] Intra-Area-Prefix-LSA parse error #%d: %s",
-                                    index + 1,
-                                    exc
-                                )
-                                return
-                            
-                        lsu_lsa_headers.append(lsa_header)
-
-                        offset += ls_length
-
-                    if offset != pkt_len:
-                        self.logger.warning(
-                            "[OSPF][LSU] length mismatch "
-                            "parsed=%d packet=%d",
-                            offset,
-                            pkt_len
-                        )
-                        return
-                        
-                    self.log_lsu(
+                    self.handle_ospf_lsu(
                         in_port,
                         ipv6_pkt,
+                        ospf_data,
                         pkt_len,
                         router_id_text,
-                        area_id_text,
-                        lsu_lsa_headers
+                        area_id_text
                     )
-
-                    if lsu_lsa_headers:
-                        self.update_lsa_request_list(lsu_lsa_headers)
-                        self.update_lsdb(lsu_lsa_headers)
-
-                        if not self.local_lsas:
-                            self.initialize_local_lsas()
-
-                        self.send_ls_ack(lsu_lsa_headers)
