@@ -838,6 +838,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.lsdb = {}
         self.ipv6_routing_table = {}
         self.local_lsas = {}
+        self.local_lsa_ack_pending = {}
         self.local_lsu_sent = False
 
         self.local_router_lsa_sequence = OSPF_INITIAL_SEQUENCE
@@ -978,7 +979,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                         router_id_text,
                         area_id_text
                     )
-                    
+
                 elif version == 3 and pkt_type == 5 and pkt_len >= 36:
                     self.handle_ospf_lsack(
                         in_port,
@@ -1530,6 +1531,8 @@ class OSPFv3Controller(app_manager.RyuApp):
             len(lsa_headers)
         )
 
+        acknowledged_count = 0
+
         for lsa in lsa_headers:
             key = (
                 lsa["ls_type"],
@@ -1556,6 +1559,41 @@ class OSPFv3Controller(app_manager.RyuApp):
                 lsa["ls_sequence"],
                 lsa["ls_checksum"],
                 matched
+            )
+
+            pending_lsa = self.local_lsa_ack_pending.get(
+                key
+            )
+
+            pending_match = (
+                pending_lsa is not None
+                and pending_lsa["ls_sequence"]
+                == lsa["ls_sequence"]
+                and pending_lsa["ls_checksum"]
+                == lsa["ls_checksum"]
+            )
+
+            if pending_match:
+                del self.local_lsa_ack_pending[key]
+                acknowledged_count += 1
+
+                self.logger.info(
+                    "[OSPF][LSAck] acknowledged %s "
+                    "adv=%s lsid=%s pending=%d",
+                    ospfv3_lsa_type_description(
+                        lsa["ls_type"]
+                    ),
+                    lsa["advertising_router"],
+                    lsa["link_state_id"],
+                    len(self.local_lsa_ack_pending)
+                )
+
+        if (
+            acknowledged_count > 0
+            and not self.local_lsa_ack_pending
+        ):
+            self.logger.info(
+                "[OSPF][LSAck] all local LSAs acknowledged"
             )
 
     def send_frame(self, frame, out_port):
@@ -1662,6 +1700,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.dbd_exchange_complete = False
         self.lsa_request_list = []
         self.lsr_sent = False
+        self.local_lsa_ack_pending = {}
 
         self.dbd_sequence = (
             int(time.time() * 1000)
@@ -2796,17 +2835,28 @@ class OSPFv3Controller(app_manager.RyuApp):
             self.ospf_neighbor_mac
         )
 
+        self.local_lsa_ack_pending = {
+            key: {
+                "ls_sequence": lsa["ls_sequence"],
+                "ls_checksum": lsa["ls_checksum"]
+            }
+            for key, lsa in self.local_lsas.items()
+        }
+        
         if not self.send_frame(
             frame,
             self.ospf_port
         ):
+            self.local_lsa_ack_pending = {}
             return False
 
         self.logger.info(
-            "[OSPF][LSU TX] to=%s lsas=%d frame-length=%d",
+            "[OSPF][LSU TX] to=%s lsas=%d "
+            "frame-length=%d pending-acks=%d",
             self.ospf_neighbor_ipv6,
             len(self.local_lsas),
-            len(frame)
+            len(frame),
+            len(self.local_lsa_ack_pending)
         )
 
         return True
