@@ -45,6 +45,10 @@ OSPF_INTERFACE_COST = 10
 
 OSPF_LAN_PREFIX_METRIC = 10
 
+OSPF_RETRANSMIT_INTERVAL = 5
+
+TEST_IGNORE_LOCAL_LSACK = False
+
 def mac_to_bytes(mac):
     return bytes(
         int(part, 16)
@@ -851,6 +855,10 @@ class OSPFv3Controller(app_manager.RyuApp):
         
         self.lsdb_aging_thread = hub.spawn(self.lsdb_aging_loop)
 
+        self.local_lsu_last_tx = None
+        self.local_lsa_retransmission_thread = hub.spawn(
+            self.local_lsa_retransmission_loop
+        )
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
@@ -1573,7 +1581,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                 == lsa["ls_checksum"]
             )
 
-            if pending_match:
+            if pending_match and not TEST_IGNORE_LOCAL_LSACK:
                 del self.local_lsa_ack_pending[key]
                 acknowledged_count += 1
 
@@ -1592,6 +1600,8 @@ class OSPFv3Controller(app_manager.RyuApp):
             acknowledged_count > 0
             and not self.local_lsa_ack_pending
         ):
+            self.local_lsu_last_tx = None
+
             self.logger.info(
                 "[OSPF][LSAck] all local LSAs acknowledged"
             )
@@ -1701,6 +1711,8 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.lsa_request_list = []
         self.lsr_sent = False
         self.local_lsa_ack_pending = {}
+        self.local_lsu_last_tx = None
+        self.local_lsu_sent = False
 
         self.dbd_sequence = (
             int(time.time() * 1000)
@@ -2809,6 +2821,51 @@ class OSPFv3Controller(app_manager.RyuApp):
             + b"".join(lsa_bytes)
         )
 
+    def build_pending_local_ls_update_body(self):
+        """
+        Builds an LSU body containing only locally originated LSAs
+        that are still waiting for acknowledgment.
+        """
+
+        if not self.local_lsa_ack_pending:
+            return None
+
+        lsa_bytes = []
+
+        for key in sorted(self.local_lsa_ack_pending):
+            local_lsa = self.local_lsas.get(key)
+            pending_lsa = self.local_lsa_ack_pending[key]
+
+            if local_lsa is None:
+                continue
+
+            same_instance = (
+                local_lsa["ls_sequence"]
+                == pending_lsa["ls_sequence"]
+                and local_lsa["ls_checksum"]
+                == pending_lsa["ls_checksum"]
+            )
+
+            if not same_instance:
+                continue
+
+            lsa_bytes.append(
+                local_lsa["raw_lsa"]
+            )
+
+        if not lsa_bytes:
+            return None
+
+        body = (
+            struct.pack(
+                "!I",
+                len(lsa_bytes)
+            )
+            + b"".join(lsa_bytes)
+        )
+
+        return body, len(lsa_bytes)
+
     def send_local_ls_update(self):
         """
         Sends all locally originated LSAs to the OSPF neighbor
@@ -2848,7 +2905,10 @@ class OSPFv3Controller(app_manager.RyuApp):
             self.ospf_port
         ):
             self.local_lsa_ack_pending = {}
+            self.local_lsu_last_tx = None
             return False
+
+        self.local_lsu_last_tx = time.monotonic()
 
         self.logger.info(
             "[OSPF][LSU TX] to=%s lsas=%d "
@@ -2860,6 +2920,77 @@ class OSPFv3Controller(app_manager.RyuApp):
         )
 
         return True
+
+    def send_local_lsa_retransmission(self):
+        """
+        Retransmits locally originated LSAs that have not yet
+        been acknowledged by the OSPF neighbor.
+        """
+
+        if self.ospf_port is None:
+            return False
+
+        if self.ospf_neighbor_ipv6 is None:
+            return False
+
+        if self.ospf_neighbor_mac is None:
+            return False
+
+        result = self.build_pending_local_ls_update_body()
+
+        if result is None:
+            return False
+
+        lsu_body, lsa_count = result
+
+        frame = build_ospfv3_lsu_frame(
+            lsu_body,
+            self.ospf_neighbor_ipv6,
+            self.ospf_neighbor_mac
+        )
+
+        if not self.send_frame(
+            frame,
+            self.ospf_port
+        ):
+            return False
+
+        self.local_lsu_last_tx = time.monotonic()
+
+        self.logger.info(
+            "[OSPF][LSU RETX] to=%s lsas=%d "
+            "frame-length=%d pending-acks=%d",
+            self.ospf_neighbor_ipv6,
+            lsa_count,
+            len(frame),
+            len(self.local_lsa_ack_pending)
+        )
+
+        return True
+
+    def local_lsa_retransmission_loop(self):
+        """
+        Periodically retransmits unacknowledged local LSAs.
+        """
+
+        while True:
+            hub.sleep(1)
+
+            if not self.local_lsa_ack_pending:
+                continue
+
+            if self.local_lsu_last_tx is None:
+                continue
+
+            elapsed = (
+                time.monotonic()
+                - self.local_lsu_last_tx
+            )
+
+            if elapsed < OSPF_RETRANSMIT_INTERVAL:
+                continue
+
+            self.send_local_lsa_retransmission()
 
     def log_hello(
         self,
