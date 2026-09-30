@@ -978,6 +978,16 @@ class OSPFv3Controller(app_manager.RyuApp):
                         router_id_text,
                         area_id_text
                     )
+                    
+                elif version == 3 and pkt_type == 5 and pkt_len >= 36:
+                    self.handle_ospf_lsack(
+                        in_port,
+                        ipv6_pkt,
+                        ospf_data,
+                        pkt_len,
+                        router_id_text,
+                        area_id_text
+                    )
 
     def handle_ospf_hello(
         self,
@@ -1453,6 +1463,100 @@ class OSPFv3Controller(app_manager.RyuApp):
             ):
                 if self.send_local_ls_update():
                     self.local_lsu_sent = True
+
+    def handle_ospf_lsack(
+        self,
+        in_port,
+        ipv6_pkt,
+        ospf_data,
+        pkt_len,
+        router_id_text,
+        area_id_text
+    ):
+        """
+        Handles a received OSPFv3 Link State Acknowledgment packet.
+        """
+
+        ack_data_length = pkt_len - 16
+
+        if ack_data_length <= 0 or ack_data_length % 20 != 0:
+            self.logger.warning(
+                "[OSPF][LSAck RX] invalid payload length=%d",
+                ack_data_length
+            )
+            return
+
+        lsa_headers = []
+
+        offset = 16
+
+        while offset < pkt_len:
+            (
+                ls_age,
+                ls_type,
+                link_state_id,
+                advertising_router,
+                ls_sequence,
+                ls_checksum,
+                ls_length
+            ) = struct.unpack(
+                "!HHIIIHH",
+                ospf_data[offset:offset + 20]
+            )
+
+            lsa_headers.append({
+                "ls_age": ls_age,
+                "ls_type": ls_type,
+                "link_state_id": socket.inet_ntoa(
+                    struct.pack("!I", link_state_id)
+                ),
+                "advertising_router": socket.inet_ntoa(
+                    struct.pack("!I", advertising_router)
+                ),
+                "ls_sequence": ls_sequence,
+                "ls_checksum": ls_checksum,
+                "ls_length": ls_length
+            })
+
+            offset += 20
+
+        self.logger.info(
+            "[OSPF][LSAck RX] router=%s src=%s port=%s "
+            "area=%s count=%d",
+            router_id_text,
+            ipv6_pkt.src,
+            in_port,
+            area_id_text,
+            len(lsa_headers)
+        )
+
+        for lsa in lsa_headers:
+            key = (
+                lsa["ls_type"],
+                lsa["link_state_id"],
+                lsa["advertising_router"]
+            )
+
+            local_lsa = self.local_lsas.get(key)
+
+            matched = (
+                local_lsa is not None
+                and local_lsa["ls_sequence"] == lsa["ls_sequence"]
+                and local_lsa["ls_checksum"] == lsa["ls_checksum"]
+            )
+
+            self.logger.info(
+                "  -> %s adv=%s lsid=%s "
+                "seq=0x%08x checksum=0x%04x local-match=%s",
+                ospfv3_lsa_type_description(
+                    lsa["ls_type"]
+                ),
+                lsa["advertising_router"],
+                lsa["link_state_id"],
+                lsa["ls_sequence"],
+                lsa["ls_checksum"],
+                matched
+            )
 
     def send_frame(self, frame, out_port):
         """
