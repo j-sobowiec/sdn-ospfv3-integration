@@ -47,6 +47,8 @@ OSPF_LAN_PREFIX_METRIC = 10
 
 OSPF_RETRANSMIT_INTERVAL = 5
 
+OSPF_LS_REFRESH_TIME = 1800
+
 TEST_IGNORE_LOCAL_LSACK = False
 
 def mac_to_bytes(mac):
@@ -881,9 +883,15 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.lsdb_aging_thread = hub.spawn(self.lsdb_aging_loop)
 
         self.local_lsu_last_tx = None
+
         self.local_lsa_retransmission_thread = hub.spawn(
             self.local_lsa_retransmission_loop
         )
+
+        self.local_lsa_refresh_thread = hub.spawn(
+            self.local_lsa_refresh_loop
+        )
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
@@ -3191,6 +3199,61 @@ class OSPFv3Controller(app_manager.RyuApp):
                 continue
 
             self.send_local_lsa_retransmission()
+
+    def local_lsa_refresh_loop(self):
+        """
+        Periodically refreshes locally originated LSAs.
+
+        When the oldest local LSA reaches LSRefreshTime,
+        all locally originated LSAs are reoriginated
+        with newer sequence numbers.
+        """
+
+        while True:
+            hub.sleep(1)
+
+            if not self.local_lsas:
+                continue
+
+            if not self.dbd_exchange_complete:
+                continue
+
+            if self.lsa_request_list:
+                continue
+
+            if self.local_lsa_ack_pending:
+                continue
+
+            originated_times = [
+                lsa.get("_originated_at")
+                for lsa in self.local_lsas.values()
+                if lsa.get("_originated_at") is not None
+            ]
+
+            if not originated_times:
+                continue
+
+            oldest_originated_at = min(
+                originated_times
+            )
+
+            elapsed = (
+                time.monotonic()
+                - oldest_originated_at
+            )
+
+            if elapsed < OSPF_LS_REFRESH_TIME:
+                continue
+
+            self.logger.info(
+                "[OSPF][REFRESH] local LSAs reached "
+                "refresh interval elapsed=%.1fs",
+                elapsed
+            )
+
+            self.reoriginate_local_lsas(
+                "periodic refresh"
+            )
 
     def reoriginate_local_lsas(self, reason):
         """
