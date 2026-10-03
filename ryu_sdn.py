@@ -792,6 +792,31 @@ def ospfv3_lsa_checksum(lsa_bytes):
 
     return (x << 8) | y
 
+def next_ospfv3_lsa_sequence(sequence):
+    """
+    Returns the next valid OSPF LSA sequence number.
+
+    Sequence numbers are stored as unsigned 32-bit values,
+    but OSPF compares them as signed 32-bit integers.
+    """
+
+    if not 0 <= sequence <= 0xffffffff:
+        raise ValueError(
+            "OSPF LSA sequence number is outside uint32 range"
+        )
+
+    if sequence == 0x80000000:
+        raise ValueError(
+            "0x80000000 is a reserved OSPF LSA sequence number"
+        )
+
+    if sequence == 0x7fffffff:
+        raise ValueError(
+            "OSPF LSA sequence number reached MaxSequenceNumber"
+        )
+
+    return (sequence + 1) & 0xffffffff
+
 def finalize_ospfv3_lsa_checksum(lsa_bytes):
     """
     Inserts the calculated Fletcher checksum
@@ -977,7 +1002,18 @@ class OSPFv3Controller(app_manager.RyuApp):
                         router_id_text,
                         area_id_text
                     )
+
+                elif version == 3 and pkt_type == 3 and pkt_len >= 28:
                     
+                    self.handle_ospf_lsr(
+                        in_port,
+                        ipv6_pkt,
+                        ospf_data,
+                        pkt_len,
+                        router_id_text,
+                        area_id_text
+                    )
+
                 elif version == 3 and pkt_type == 4 and pkt_len >= 20:
                     self.handle_ospf_lsu(
                         in_port,
@@ -1276,6 +1312,106 @@ class OSPFv3Controller(app_manager.RyuApp):
                 and not self.lsr_sent
             ):
                 self.send_link_state_request()
+
+    def handle_ospf_lsr(
+        self,
+        in_port,
+        ipv6_pkt,
+        ospf_data,
+        pkt_len,
+        router_id_text,
+        area_id_text
+    ):
+        """
+        Handles a received OSPFv3 Link State Request packet.
+        """
+
+        request_data_length = pkt_len - 16
+
+        if (
+            request_data_length <= 0
+            or request_data_length % 12 != 0
+        ):
+            self.logger.warning(
+                "[OSPF][LSR RX] invalid payload length=%d",
+                request_data_length
+            )
+            return
+
+        requests = []
+
+        offset = 16
+
+        while offset < pkt_len:
+            (
+                reserved,
+                ls_type,
+                link_state_id,
+                advertising_router
+            ) = struct.unpack(
+                "!HHII",
+                ospf_data[offset:offset + 12]
+            )
+
+            requests.append({
+                "ls_type": ls_type,
+                "link_state_id": socket.inet_ntoa(
+                    struct.pack("!I", link_state_id)
+                ),
+                "advertising_router": socket.inet_ntoa(
+                    struct.pack("!I", advertising_router)
+                )
+            })
+
+            offset += 12
+
+        self.logger.info(
+            "[OSPF][LSR RX] router=%s src=%s port=%s "
+            "area=%s count=%d",
+            router_id_text,
+            ipv6_pkt.src,
+            in_port,
+            area_id_text,
+            len(requests)
+        )
+
+        requested_local_lsas = []
+        requested_keys = set()
+
+        for request in requests:
+            key = (
+                request["ls_type"],
+                request["link_state_id"],
+                request["advertising_router"]
+            )
+
+            local_lsa = self.local_lsas.get(key)
+            local_match = local_lsa is not None
+
+            self.logger.info(
+                "  -> %s adv=%s lsid=%s local-match=%s",
+                ospfv3_lsa_type_description(
+                    request["ls_type"]
+                ),
+                request["advertising_router"],
+                request["link_state_id"],
+                local_match
+            )
+
+            if (
+                local_lsa is not None
+                and key not in requested_keys
+            ):
+                requested_local_lsas.append(
+                    local_lsa
+                )
+
+                requested_keys.add(key)
+
+        if requested_local_lsas:
+            self.send_local_lsr_response(
+                requested_local_lsas
+            )
 
     def handle_ospf_lsu(
         self,
@@ -2921,6 +3057,70 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         return True
 
+    def send_local_lsr_response(self, local_lsas):
+        """
+        Sends an LSU containing locally originated LSAs
+        requested by the OSPF neighbor.
+        """
+
+        if self.ospf_port is None:
+            return False
+
+        if self.ospf_neighbor_ipv6 is None:
+            return False
+
+        if self.ospf_neighbor_mac is None:
+            return False
+
+        if not local_lsas:
+            return False
+
+        lsu_body = (
+            struct.pack(
+                "!I",
+                len(local_lsas)
+            )
+            + b"".join(
+                lsa["raw_lsa"]
+                for lsa in local_lsas
+            )
+        )
+
+        frame = build_ospfv3_lsu_frame(
+            lsu_body,
+            self.ospf_neighbor_ipv6,
+            self.ospf_neighbor_mac
+        )
+
+        if not self.send_frame(
+            frame,
+            self.ospf_port
+        ):
+            return False
+
+        self.logger.info(
+            "[OSPF][LSR RESPONSE TX] to=%s "
+            "lsas=%d frame-length=%d",
+            self.ospf_neighbor_ipv6,
+            len(local_lsas),
+            len(frame)
+        )
+
+        for lsa in local_lsas:
+            self.logger.info(
+                "  -> %s adv=%s lsid=%s "
+                "seq=0x%08x checksum=0x%04x",
+                ospfv3_lsa_type_description(
+                    lsa["ls_type"]
+                ),
+                lsa["advertising_router"],
+                lsa["link_state_id"],
+                lsa["ls_sequence"],
+                lsa["ls_checksum"]
+            )
+
+        return True
+
     def send_local_lsa_retransmission(self):
         """
         Retransmits locally originated LSAs that have not yet
@@ -2991,6 +3191,90 @@ class OSPFv3Controller(app_manager.RyuApp):
                 continue
 
             self.send_local_lsa_retransmission()
+
+    def reoriginate_local_lsas(self, reason):
+        """
+        Reoriginates all locally generated LSAs using newer
+        sequence numbers and sends them to the OSPF neighbor.
+        """
+
+        if not self.local_lsas:
+            self.logger.warning(
+                "[OSPF][REORIGINATE] local LSDB is empty"
+            )
+            return False
+
+        if self.local_lsa_ack_pending:
+            self.logger.warning(
+                "[OSPF][REORIGINATE] postponed - "
+                "previous local LSAs are still awaiting acknowledgment"
+            )
+            return False
+
+        if self.get_ospf_neighbor_interface_id() is None:
+            self.logger.warning(
+                "[OSPF][REORIGINATE] neighbor interface ID unavailable"
+            )
+            return False
+
+        self.local_router_lsa_sequence = (
+            next_ospfv3_lsa_sequence(
+                self.local_router_lsa_sequence
+            )
+        )
+
+        self.local_link_lsa_sequence = (
+            next_ospfv3_lsa_sequence(
+                self.local_link_lsa_sequence
+            )
+        )
+
+        self.local_prefix_lsa_sequence = (
+            next_ospfv3_lsa_sequence(
+                self.local_prefix_lsa_sequence
+            )
+        )
+
+        router_lsa = self.build_local_router_lsa()
+
+        if router_lsa is None:
+            return False
+
+        link_lsa = self.build_local_link_lsa()
+
+        prefix_lsa = (
+            self.build_local_intra_area_prefix_lsa()
+        )
+
+        self.local_lsas = {}
+
+        self.install_local_lsa(router_lsa)
+        self.install_local_lsa(link_lsa)
+        self.install_local_lsa(prefix_lsa)
+
+        self.logger.info(
+            "[OSPF][REORIGINATE] reason=%s entries=%d",
+            reason,
+            len(self.local_lsas)
+        )
+
+        for key, lsa in sorted(
+            self.local_lsas.items(),
+            key=lambda item: item[0]
+        ):
+            self.logger.info(
+                "  -> %s adv=%s lsid=%s "
+                "seq=0x%08x checksum=0x%04x",
+                ospfv3_lsa_type_description(
+                    lsa["ls_type"]
+                ),
+                lsa["advertising_router"],
+                lsa["link_state_id"],
+                lsa["ls_sequence"],
+                lsa["ls_checksum"]
+            )
+
+        return self.send_local_ls_update()
 
     def log_hello(
         self,
