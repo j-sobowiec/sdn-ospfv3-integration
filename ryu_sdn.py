@@ -49,8 +49,6 @@ OSPF_RETRANSMIT_INTERVAL = 5
 
 OSPF_LS_REFRESH_TIME = 1800
 
-TEST_IGNORE_LOCAL_LSACK = False
-
 def mac_to_bytes(mac):
     return bytes(
         int(part, 16)
@@ -1725,7 +1723,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                 == lsa["ls_checksum"]
             )
 
-            if pending_match and not TEST_IGNORE_LOCAL_LSACK:
+            if pending_match:
                 del self.local_lsa_ack_pending[key]
                 acknowledged_count += 1
 
@@ -2894,50 +2892,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                 lsa["ls_checksum"],
                 lsa["ls_length"]
             )
-
-        lsu_body = self.build_local_ls_update_body()
-
-        self.logger.info(
-            "[OSPF][LOCAL LSU] body-ready "
-            "lsas=%d body-length=%d",
-            len(self.local_lsas),
-            len(lsu_body)
-        )
-
-        if self.ospf_neighbor_ipv6 is not None:
-            lsu_packet = build_ospfv3_lsu(
-                lsu_body,
-                self.ospf_neighbor_ipv6
-            )
-
-            lsu_checksum = struct.unpack(
-                "!H",
-                lsu_packet[12:14]
-            )[0]
-
-            self.logger.info(
-                "[OSPF][LOCAL LSU] packet-ready "
-                "type=%d length=%d checksum=0x%04x",
-                lsu_packet[1],
-                len(lsu_packet),
-                lsu_checksum
-            )
-
-        if (
-            self.ospf_neighbor_ipv6 is not None
-            and self.ospf_neighbor_mac is not None
-        ):
-            lsu_frame = build_ospfv3_lsu_frame(
-                lsu_body,
-                self.ospf_neighbor_ipv6,
-                self.ospf_neighbor_mac
-            )
-
-            self.logger.info(
-                "[OSPF][LOCAL LSU] frame-ready length=%d",
-                len(lsu_frame)
-            )
-
+            
         return True
 
     def build_local_ls_update_body(self):
