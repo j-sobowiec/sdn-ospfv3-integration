@@ -181,3 +181,21 @@ class LSDB:
             )
 
         return routing_changed
+
+    def clear_remote(self, local_router_id):
+        removed = 0
+
+        for key, lsa in list(self.entries.items()):
+            if lsa.get("advertising_router") == local_router_id:
+                continue
+
+            del self.entries[key]
+            removed += 1
+
+        if removed:
+            self.logger.info(
+                "[OSPF][LSDB] cleared remote entries=%d",
+                removed
+            )
+
+        return removed > 0

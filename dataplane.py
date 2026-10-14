@@ -45,6 +45,16 @@ class DataPlane:
 
         return changed
 
+    def reset(self):
+        self.lan_port = None
+        self.lan_hosts.clear()
+
+        self.transit_port = None
+        self.transit_neighbors.clear()
+
+        self.transit_router_mac = None
+        self.transit_router_ipv6 = None
+
     def handle_ndp(
         self,
         pkt,

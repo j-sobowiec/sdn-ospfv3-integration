@@ -56,6 +56,8 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.local_lsa_ack_pending = {}
         self.local_lsu_sent = False
 
+        self.local_lsa_rebuild_required = False
+
         self.hello_thread = hub.spawn(self.hello_loop)
         
         self.lsdb_aging_thread = hub.spawn(self.lsdb_aging_loop)
@@ -75,12 +77,38 @@ class OSPFv3Controller(app_manager.RyuApp):
         datapath = ev.msg.datapath
         self.datapath = datapath
 
+        self.data_plane.reset()
         self.installed_ipv6_host_flows.clear()
         self.pending_ndp_barriers.clear()
 
+        self.neighbor.reset()
+
+        remote_routing_changed = (
+            self.lsdb.clear_remote(cfg.ROUTER_ID)
+        )
+
+        self.local_lsa_ack_pending.clear()
+        self.local_lsu_sent = False
+        self.local_lsu_last_tx = None
+
+        self.local_lsa_rebuild_required = bool(
+            self.local_lsa
+        )
+
+        if remote_routing_changed:
+            self.recompute_routing_state()
+
+        self.logger.info(
+            "[DATA][RESET] dynamic data-plane state cleared"
+        )
+
+        self.logger.info(
+            "[OSPF][RESET] neighbor session and remote LSDB cleared"
+        )
+                        
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
+    
         match = parser.OFPMatch()
 
         actions = [
@@ -462,7 +490,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                 )
 
                 self.try_install_ipv6_host_flows()
-                
+
             # Ethernet = 14 bajtów
             # IPv6 = 40 bajtów
             ospf_offset = 14 + 40
@@ -893,6 +921,24 @@ class OSPFv3Controller(app_manager.RyuApp):
                 and not self.neighbor.request_list
                 and not self.local_lsu_sent
             ):
+                if self.local_lsa_rebuild_required:
+                    if not self.local_lsa.reoriginate(
+                        self.neighbor.router_id,
+                        "neighbor session restarted"
+                    ):
+                        self.logger.warning(
+                            "[OSPF][REORIGINATE] "
+                            "failed after neighbor restart"
+                        )
+                        return
+
+                    self.local_lsa_rebuild_required = False
+
+                    self.logger.info(
+                        "[OSPF][REORIGINATE] "
+                        "local LSAs rebuilt after neighbor restart"
+                    )
+
                 if self.send_local_ls_update():
                     self.local_lsu_sent = True
 

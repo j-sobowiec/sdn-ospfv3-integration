@@ -93,3 +93,12 @@ class Neighbor:
             self.logger.info(
                 "[OSPF][LSR] request-list complete"
             )
+
+    def reset(self):
+        self.port = None
+        self.router_id = None
+        self.ipv6 = None
+        self.mac = None
+        self.router_ids = []
+
+        self.reset_exchange()
