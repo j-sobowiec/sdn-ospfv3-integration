@@ -230,7 +230,15 @@ def main():
         info("Starting routers and daemons\n")
         net.start()
 
-        info("Controler s1:\n")
+        info("*** Waiting for switches to connect to the controller\n")
+
+        if not net.waitConnected(timeout=15):
+            info("*** ERROR: switch did not connect to controller\n")
+            return
+
+        info("*** Network ready\n")
+
+        info("Controller s1:\n")
         info(s1.cmd("ovs-vsctl get-controller s1"))
 
         info("OpenFlow flows:\n")
@@ -243,11 +251,12 @@ def main():
         info("r1 vtysh -c 'show ipv6 ospf6 neighbor'\n")
         info("r2 vtysh -c 'show ipv6 route ospf6'\n")
         info("h1 ping -6 -c 3 2001:db8:23::3\n\n")
+
         CLI(net)
+
     finally:
         info("Stopping network\n")
         net.stop()
-
 
 if __name__ == "__main__":
     setLogLevel("info")
