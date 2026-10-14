@@ -472,27 +472,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                 return
                 
         if ipv6_pkt and ipv6_pkt.nxt == 89:
-            transit_changed = (
-                self.data_plane.learn_transit_router(
-                    in_port=in_port,
-                    ipv6_address=ipv6_pkt.src,
-                    mac_address=eth_pkt.src
-                )
-            )
 
-            if transit_changed:
-                self.logger.info(
-                    "[DATA][TRANSIT LEARN] "
-                    "ipv6=%s mac=%s port=%s",
-                    ipv6_pkt.src,
-                    eth_pkt.src,
-                    in_port
-                )
-
-                self.try_install_ipv6_host_flows()
-
-            # Ethernet = 14 bajtów
-            # IPv6 = 40 bajtów
             ospf_offset = 14 + 40
 
             ospf_data = msg.data[ospf_offset:]
@@ -658,6 +638,26 @@ class OSPFv3Controller(app_manager.RyuApp):
             neighbors
         )
 
+        transit_changed = (
+            self.data_plane.learn_transit_router(
+                in_port=self.neighbor.port,
+                ipv6_address=self.neighbor.ipv6,
+                mac_address=self.neighbor.mac
+            )
+        )
+
+        if transit_changed:
+            self.logger.info(
+                "[DATA][TRANSIT LEARN] "
+                "source=verified-ospf-hello "
+                "ipv6=%s mac=%s port=%s",
+                self.neighbor.ipv6,
+                self.neighbor.mac,
+                self.neighbor.port
+            )
+
+            self.try_install_ipv6_host_flows()
+        
     def handle_ospf_dbd(
         self,
         in_port,
