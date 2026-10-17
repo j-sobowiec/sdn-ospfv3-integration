@@ -8,6 +8,7 @@ from ospfv3.lsa import (
     finalize_ospfv3_lsa_checksum,
     next_ospfv3_lsa_sequence,
     ospfv3_lsa_type_description,
+    lsa_sequence_signed,
 )
 
 
@@ -39,6 +40,116 @@ class LocalLSA:
 
     def clear(self):
         self.entries.clear()
+
+    def recover_sequences(
+        self,
+        lsa_headers,
+        prepare_next
+    ):
+        """
+        Recovers sequence state from self-originated LSA summaries
+        learned from an OSPF neighbor.
+
+        When local LSAs do not exist yet, prepare_next=True makes
+        the next locally originated instance newer than the copy
+        stored by the neighbor.
+
+        When local LSAs already exist, prepare_next=False only moves
+        the sequence floor forward. A later reorigination performs
+        the actual increment.
+        """
+
+        interface_lsid = socket.inet_ntoa(
+            struct.pack(
+                "!I",
+                cfg.INTERFACE_ID
+            )
+        )
+
+        changed = False
+        recovered = 0
+
+        for lsa in lsa_headers:
+            if (
+                lsa["advertising_router"]
+                != cfg.ROUTER_ID
+            ):
+                continue
+
+            sequence_attribute = None
+
+            if (
+                lsa["ls_type"] == 0x2001
+                and lsa["link_state_id"] == "0.0.0.0"
+            ):
+                sequence_attribute = "router_sequence"
+
+            elif (
+                lsa["ls_type"] == 0x0008
+                and lsa["link_state_id"] == interface_lsid
+            ):
+                sequence_attribute = "link_sequence"
+
+            elif (
+                lsa["ls_type"] == 0x2009
+                and lsa["link_state_id"] == "0.0.0.0"
+            ):
+                sequence_attribute = "prefix_sequence"
+
+            if sequence_attribute is None:
+                continue
+
+            observed_sequence = lsa["ls_sequence"]
+            candidate_sequence = observed_sequence
+
+            if prepare_next:
+                try:
+                    candidate_sequence = (
+                        next_ospfv3_lsa_sequence(
+                            observed_sequence
+                        )
+                    )
+                except ValueError as exc:
+                    self.logger.warning(
+                        "[OSPF][SELF LSA] "
+                        "cannot recover sequence: %s",
+                        exc
+                    )
+                    continue
+
+            current_sequence = getattr(
+                self,
+                sequence_attribute
+            )
+
+            if (
+                lsa_sequence_signed(candidate_sequence)
+                > lsa_sequence_signed(current_sequence)
+            ):
+                setattr(
+                    self,
+                    sequence_attribute,
+                    candidate_sequence
+                )
+
+                changed = True
+
+            recovered += 1
+
+            self.logger.info(
+                "[OSPF][SELF LSA] recovered "
+                "type=0x%04x lsid=%s "
+                "observed=0x%08x prepared=0x%08x",
+                lsa["ls_type"],
+                lsa["link_state_id"],
+                observed_sequence,
+                getattr(
+                    self,
+                    sequence_attribute
+                )
+            )
+
+        return changed, recovered
 
     def get_neighbor_interface_id(self, neighbor_router_id):
         if neighbor_router_id is None:

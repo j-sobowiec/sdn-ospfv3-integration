@@ -8,6 +8,7 @@ from ryu.lib.packet import ipv6
 import struct
 import socket
 from ryu.lib.packet import ethernet
+from ryu.lib.packet import ether_types
 from ryu.lib import hub
 import time
 import ipaddress
@@ -57,6 +58,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.local_lsu_sent = False
 
         self.local_lsa_rebuild_required = False
+        self.ospf_resync_required = True
 
         self.hello_thread = hub.spawn(self.hello_loop)
         
@@ -82,6 +84,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.pending_ndp_barriers.clear()
 
         self.neighbor.reset()
+        self.ospf_resync_required = True
 
         remote_routing_changed = (
             self.lsdb.clear_remote(cfg.ROUTER_ID)
@@ -245,13 +248,27 @@ class OSPFv3Controller(app_manager.RyuApp):
         transit_port = self.data_plane.transit_port
         transit_mac = self.data_plane.transit_router_mac
 
+        ospf_routes = self.get_ospf_transit_routes()
+
+        route_signature = tuple(
+            sorted(
+                (
+                    route["prefix"],
+                    route["prefix_length"],
+                    route["next_hop"]
+                )
+                for route in ospf_routes
+            )
+        )
+
         state = (
             host_mac,
             lan_port,
             transit_mac,
-            transit_port
+            transit_port,
+            route_signature
         )
-
+        
         if (
             self.installed_ipv6_host_flows.get(host_ipv6)
             == state
@@ -292,44 +309,60 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         datapath.send_msg(flow_mod)
 
-        #
-        # LAN -> R1
-        #
-        match = parser.OFPMatch(
-            in_port=lan_port,
-            eth_type=0x86dd,
-            ipv6_src=host_ipv6,
-            eth_dst=cfg.ROUTER_MAC
-        )
-
-        actions = [
-            parser.OFPActionDecNwTtl(),
-            parser.OFPActionSetField(
-                eth_src=cfg.ROUTER_MAC
-            ),
-            parser.OFPActionSetField(
-                eth_dst=transit_mac
-            ),
-            parser.OFPActionOutput(
-                transit_port
+        for route in ospf_routes:
+            network = ipaddress.IPv6Network(
+                f'{route["prefix"]}/{route["prefix_length"]}',
+                strict=False
             )
-        ]
 
-        instructions = [
-            parser.OFPInstructionActions(
-                ofproto.OFPIT_APPLY_ACTIONS,
-                actions
+            match = parser.OFPMatch(
+                in_port=lan_port,
+                eth_type=ether_types.ETH_TYPE_IPV6,
+                eth_dst=cfg.ROUTER_MAC,
+                ipv6_src=host_ipv6,
+                ipv6_dst=(
+                    str(network.network_address),
+                    str(network.netmask)
+                )
             )
-        ]
 
-        flow_mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=100,
-            match=match,
-            instructions=instructions
-        )
+            actions = [
+                parser.OFPActionDecNwTtl(),
+                parser.OFPActionSetField(
+                    eth_src=cfg.ROUTER_MAC
+                ),
+                parser.OFPActionSetField(
+                    eth_dst=transit_mac
+                ),
+                parser.OFPActionOutput(
+                    transit_port
+                )
+            ]
 
-        datapath.send_msg(flow_mod)
+            instructions = [
+                parser.OFPInstructionActions(
+                    ofproto.OFPIT_APPLY_ACTIONS,
+                    actions
+                )
+            ]
+
+            flow_mod = parser.OFPFlowMod(
+                datapath=datapath,
+                priority=110,
+                match=match,
+                instructions=instructions
+            )
+
+            datapath.send_msg(flow_mod)
+
+            self.logger.info(
+                "[DATA][ROUTE FLOW INSTALL] "
+                "host=%s dst=%s/%d via=%s",
+                host_ipv6,
+                route["prefix"],
+                route["prefix_length"],
+                route["next_hop"]
+            )
 
         #
         # R1 -> LAN host
@@ -611,19 +644,6 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.neighbor.mac = eth_pkt.src
         self.neighbor.router_id = router_id_text
 
-        if router_id_text not in self.neighbor.router_ids:
-            self.neighbor.router_ids.append(
-                router_id_text
-            )
-
-            self.logger.info(
-                "[OSPF][NEIGHBOR] discovered router=%s src=%s",
-                router_id_text,
-                ipv6_pkt.src
-            )
-
-            self.send_ospfv3_hello()
-
         self.log_hello(
             in_port,
             ipv6_pkt,
@@ -638,6 +658,7 @@ class OSPFv3Controller(app_manager.RyuApp):
             neighbors
         )
 
+        # Learn the transit-side L2 state only from a valid OSPF Hello.
         transit_changed = (
             self.data_plane.learn_transit_router(
                 in_port=self.neighbor.port,
@@ -657,6 +678,42 @@ class OSPFv3Controller(app_manager.RyuApp):
             )
 
             self.try_install_ipv6_host_flows()
+
+        # After a controller/switch restart, FRR may still consider the
+        # previous OSPF adjacency alive because DeadInterval has not expired.
+        #
+        # If the peer still lists our Router ID, send one Hello without
+        # advertising the peer as a neighbor. This forces the old adjacency
+        # to be resynchronized.
+        if self.ospf_resync_required:
+            self.ospf_resync_required = False
+
+            if cfg.ROUTER_ID in neighbors:
+                self.logger.info(
+                    "[OSPF][RESYNC] "
+                    "peer retained previous adjacency; "
+                    "sending one-way Hello"
+                )
+
+                self.send_ospfv3_hello(
+                    neighbors=[]
+                )
+
+                return
+
+        if router_id_text not in self.neighbor.router_ids:
+            self.neighbor.router_ids.append(
+                router_id_text
+            )
+
+            self.logger.info(
+                "[OSPF][NEIGHBOR] "
+                "discovered router=%s src=%s",
+                router_id_text,
+                ipv6_pkt.src
+            )
+
+            self.send_ospfv3_hello()
         
     def handle_ospf_dbd(
         self,
@@ -751,13 +808,47 @@ class OSPFv3Controller(app_manager.RyuApp):
             )
 
             self.neighbor.dbd_negotiated = True
-            self.neighbor.request_list = list(
-                lsa_headers
+
+            self_originated_headers = [
+                lsa
+                for lsa in lsa_headers
+                if (
+                    lsa["advertising_router"]
+                    == cfg.ROUTER_ID
+                )
+            ]
+
+            remote_headers = [
+                lsa
+                for lsa in lsa_headers
+                if (
+                    lsa["advertising_router"]
+                    != cfg.ROUTER_ID
+                )
+            ]
+
+            sequence_changed, recovered_count = (
+                self.local_lsa.recover_sequences(
+                    self_originated_headers,
+                    prepare_next=not bool(
+                        self.local_lsa
+                    )
+                )
             )
 
+            if (
+                sequence_changed
+                and self.local_lsa
+            ):
+                self.local_lsa_rebuild_required = True
+
+            self.neighbor.request_list = remote_headers
+
             self.logger.info(
-                "[OSPF][DBD] request-list=%d",
-                len(self.neighbor.request_list)
+                "[OSPF][DBD] request-list=%d "
+                "self-originated=%d",
+                len(self.neighbor.request_list),
+                recovered_count
             )
 
             self.neighbor.dbd_sequence = (
@@ -901,9 +992,52 @@ class OSPFv3Controller(app_manager.RyuApp):
                 lsu_lsa_headers
             )
 
-            routing_changed = self.lsdb.update(
-                lsu_lsa_headers
-            )
+            self_originated_lsas = [
+                lsa
+                for lsa in lsu_lsa_headers
+                if (
+                    lsa["advertising_router"]
+                    == cfg.ROUTER_ID
+                )
+            ]
+
+            remote_lsas = [
+                lsa
+                for lsa in lsu_lsa_headers
+                if (
+                    lsa["advertising_router"]
+                    != cfg.ROUTER_ID
+                )
+            ]
+
+            if self_originated_lsas:
+                sequence_changed, recovered_count = (
+                    self.local_lsa.recover_sequences(
+                        self_originated_lsas,
+                        prepare_next=not bool(
+                            self.local_lsa
+                        )
+                    )
+                )
+
+                self.logger.info(
+                    "[OSPF][SELF LSA] "
+                    "received=%d excluded-from-remote-lsdb",
+                    recovered_count
+                )
+
+                if (
+                    sequence_changed
+                    and self.local_lsa
+                ):
+                    self.local_lsa_rebuild_required = True
+
+            routing_changed = False
+
+            if remote_lsas:
+                routing_changed = self.lsdb.update(
+                    remote_lsas
+                )
 
             if routing_changed:
                 self.recompute_routing_state()
@@ -1072,12 +1206,15 @@ class OSPFv3Controller(app_manager.RyuApp):
 
         return True
 
-    def send_ospfv3_hello(self):
+    def send_ospfv3_hello(self, neighbors=None):
         if self.neighbor.port is None:
             return
 
+        if neighbors is None:
+            neighbors = self.neighbor.router_ids
+
         frame = build_ospfv3_hello_frame(
-            self.neighbor.router_ids
+            neighbors
         )
 
         if not self.send_frame(
@@ -1089,7 +1226,7 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.logger.info(
             "[OSPF][HELLO TX] port=%s neighbors=%s",
             self.neighbor.port,
-            self.neighbor.router_ids
+            neighbors
         )
 
     def hello_loop(self):
@@ -1275,6 +1412,16 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.log_spf_result()
         self.log_ipv6_routing_table()
 
+        for route in self.get_ospf_transit_routes():
+            self.logger.info(
+                "[DATA][ROUTE CANDIDATE] %s/%s via=%s",
+                route["prefix"],
+                route["prefix_length"],
+                route["next_hop"]
+            )
+
+        self.try_install_ipv6_host_flows()
+        
     def send_local_ls_update(self):
         """
         Sends all locally originated LSAs to the OSPF neighbor
@@ -1535,6 +1682,20 @@ class OSPFv3Controller(app_manager.RyuApp):
             return False
 
         return self.send_local_ls_update()
+
+    def get_ospf_transit_routes(self):
+        routes = []
+
+        for route in self.ipv6_routing_table.values():
+            if route.get("source") != "ospf":
+                continue
+
+            if route.get("interface") != "transit":
+                continue
+
+            routes.append(route)
+
+        return routes
 
     def log_hello(
         self,
