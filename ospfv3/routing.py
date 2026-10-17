@@ -84,7 +84,7 @@ class Routing:
         root = cfg.ROUTER_ID
 
         if root not in graph:
-            return {}, {}
+            graph[root] = []
 
         distances = {
             router_id: float("inf")

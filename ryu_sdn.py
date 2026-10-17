@@ -61,6 +61,10 @@ class OSPFv3Controller(app_manager.RyuApp):
         self.ospf_resync_required = True
 
         self.hello_thread = hub.spawn(self.hello_loop)
+
+        self.neighbor_dead_thread = hub.spawn(
+            self.neighbor_dead_loop
+        )
         
         self.lsdb_aging_thread = hub.spawn(self.lsdb_aging_loop)
 
@@ -111,7 +115,24 @@ class OSPFv3Controller(app_manager.RyuApp):
                         
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-    
+
+        delete_flows = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE,
+            table_id=0,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+            match=parser.OFPMatch()
+        )
+
+        datapath.send_msg(
+            delete_flows
+        )
+
+        self.logger.info(
+            "[OPENFLOW] cleared table=0 stale flows"
+        )
+
         match = parser.OFPMatch()
 
         actions = [
@@ -268,7 +289,43 @@ class OSPFv3Controller(app_manager.RyuApp):
             transit_port,
             route_signature
         )
-        
+
+        previous_state = (
+            self.installed_ipv6_host_flows.get(
+                host_ipv6
+            )
+        )
+
+        if previous_state == state:
+            return False     
+
+        if previous_state is not None:
+            previous_lan_port = previous_state[1]
+            previous_route_signature = set(
+                previous_state[4]
+            )
+
+            current_route_signature = set(
+                route_signature
+            )
+
+            withdrawn_routes = (
+                previous_route_signature
+                - current_route_signature
+            )
+
+            for (
+                prefix,
+                prefix_length,
+                next_hop
+            ) in withdrawn_routes:
+                self.delete_ipv6_route_flow(
+                    host_ipv6=host_ipv6,
+                    prefix=prefix,
+                    prefix_length=prefix_length,
+                    lan_port=previous_lan_port
+                )
+
         if (
             self.installed_ipv6_host_flows.get(host_ipv6)
             == state
@@ -417,7 +474,57 @@ class OSPFv3Controller(app_manager.RyuApp):
         )
 
         return True
-    
+
+    def delete_ipv6_route_flow(
+        self,
+        host_ipv6,
+        prefix,
+        prefix_length,
+        lan_port
+    ):
+        if self.datapath is None:
+            return
+
+        datapath = self.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        network = ipaddress.IPv6Network(
+            f"{prefix}/{prefix_length}",
+            strict=False
+        )
+
+        match = parser.OFPMatch(
+            in_port=lan_port,
+            eth_type=ether_types.ETH_TYPE_IPV6,
+            eth_dst=cfg.ROUTER_MAC,
+            ipv6_src=host_ipv6,
+            ipv6_dst=(
+                str(network.network_address),
+                str(network.netmask)
+            )
+        )
+
+        flow_mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE_STRICT,
+            table_id=0,
+            priority=110,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+            match=match
+        )
+
+        datapath.send_msg(flow_mod)
+
+        self.logger.info(
+            "[DATA][ROUTE FLOW DELETE] "
+            "host=%s dst=%s/%d",
+            host_ipv6,
+            prefix,
+            prefix_length
+        )
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -503,9 +610,86 @@ class OSPFv3Controller(app_manager.RyuApp):
                     )
 
                 return
-                
-        if ipv6_pkt and ipv6_pkt.nxt == 89:
+        
+            if (
+                ipv6_pkt is not None
+                and eth_pkt is not None
+                and eth_pkt.dst == cfg.ROUTER_MAC
+                and ipv6_pkt.nxt != 89
+            ):
+                lan_host_valid = self.data_plane.learn_lan_host(
+                    in_port=in_port,
+                    ipv6_address=ipv6_pkt.src,
+                    mac_address=eth_pkt.src
+                )
 
+                if lan_host_valid:
+                    destination = ipaddress.IPv6Address(
+                        ipv6_pkt.dst
+                    )
+
+                    matching_route = None
+
+                    for route in self.get_ospf_transit_routes():
+                        network = ipaddress.IPv6Network(
+                            f'{route["prefix"]}/{route["prefix_length"]}',
+                            strict=False
+                        )
+
+                        if destination in network:
+                            matching_route = route
+                            break
+
+                    if (
+                        matching_route is not None
+                        and self.data_plane.transit_port is not None
+                        and self.data_plane.transit_router_mac is not None
+                    ):
+                        self.try_install_ipv6_host_flows()
+
+                        datapath = msg.datapath
+                        ofproto = datapath.ofproto
+                        parser = datapath.ofproto_parser
+
+                        actions = [
+                            parser.OFPActionDecNwTtl(),
+                            parser.OFPActionSetField(
+                                eth_src=cfg.ROUTER_MAC
+                            ),
+                            parser.OFPActionSetField(
+                                eth_dst=(
+                                    self.data_plane.transit_router_mac
+                                )
+                            ),
+                            parser.OFPActionOutput(
+                                self.data_plane.transit_port
+                            )
+                        ]
+
+                        packet_out = parser.OFPPacketOut(
+                            datapath=datapath,
+                            buffer_id=ofproto.OFP_NO_BUFFER,
+                            in_port=in_port,
+                            actions=actions,
+                            data=msg.data
+                        )
+
+                        datapath.send_msg(
+                            packet_out
+                        )
+
+                        self.logger.info(
+                            "[DATA][FIRST PACKET FORWARD] "
+                            "host=%s dst=%s via=%s",
+                            ipv6_pkt.src,
+                            ipv6_pkt.dst,
+                            matching_route["next_hop"]
+                        )
+
+                        return
+                      
+        if ipv6_pkt and ipv6_pkt.nxt == 89:
+        
             ospf_offset = 14 + 40
 
             ospf_data = msg.data[ospf_offset:]
@@ -639,10 +823,11 @@ class OSPFv3Controller(app_manager.RyuApp):
         dead_interval = hello["dead_interval"]
         neighbors = hello["neighbors"]
 
+        self.neighbor.mark_hello_received()
         self.neighbor.port = in_port
         self.neighbor.ipv6 = ipv6_pkt.src
         self.neighbor.mac = eth_pkt.src
-        self.neighbor.router_id = router_id_text
+        self.neighbor.router_id = router_id_text      
 
         self.log_hello(
             in_port,
@@ -1236,6 +1421,51 @@ class OSPFv3Controller(app_manager.RyuApp):
 
             hub.sleep(cfg.HELLO_INTERVAL)
 
+    def neighbor_dead_loop(self):
+        while True:
+            if self.neighbor.dead_interval_expired(
+                cfg.DEAD_INTERVAL
+            ):
+                dead_router_id = self.neighbor.router_id
+
+                self.logger.warning(
+                    "[OSPF][DEAD] neighbor=%s "
+                    "no Hello received for %ds",
+                    dead_router_id,
+                    cfg.DEAD_INTERVAL
+                )
+
+                # Stop local LSA retransmission state associated
+                # with the lost adjacency.
+                self.local_lsa_ack_pending = {}
+                self.local_lsu_last_tx = None
+                self.local_lsu_sent = False
+
+                # Remove topology learned through the lost
+                # OSPF adjacency.
+                self.lsdb.clear_remote(
+                    cfg.ROUTER_ID
+                )
+
+                # Rebuild routing before clearing transit data.
+                # This also removes stale route-derived
+                # OpenFlow entries.
+                self.recompute_routing_state()
+
+                # The OSPF next-hop is no longer valid.
+                self.data_plane.reset_transit()
+
+                # Clear the neighbor session but preserve the
+                # OpenFlow port so Hello packets can continue.
+                self.neighbor.reset_adjacency()
+
+                self.logger.warning(
+                    "[OSPF][NEIGHBOR] down router=%s",
+                    dead_router_id
+                )
+
+            hub.sleep(1)
+
     def send_initial_dbd(self):
         if self.neighbor.port is None:
             return
@@ -1421,7 +1651,7 @@ class OSPFv3Controller(app_manager.RyuApp):
             )
 
         self.try_install_ipv6_host_flows()
-        
+
     def send_local_ls_update(self):
         """
         Sends all locally originated LSAs to the OSPF neighbor

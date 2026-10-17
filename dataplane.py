@@ -55,6 +55,47 @@ class DataPlane:
         self.transit_router_mac = None
         self.transit_router_ipv6 = None
 
+    def reset_transit(self):
+        self.transit_port = None
+        self.transit_neighbors.clear()
+
+        self.transit_router_mac = None
+        self.transit_router_ipv6 = None
+
+    def learn_lan_host(
+        self,
+        in_port,
+        ipv6_address,
+        mac_address
+    ):
+        try:
+            source_ipv6 = ipaddress.IPv6Address(
+                ipv6_address
+            )
+        except ValueError:
+            return False
+
+        if source_ipv6 not in self.lan_network:
+            return False
+
+        if (
+            self.transit_port is not None
+            and in_port == self.transit_port
+        ):
+            return False
+
+        if self.lan_port is None:
+            self.lan_port = in_port
+
+        elif in_port != self.lan_port:
+            return False
+
+        self.lan_hosts[
+            ipv6_address
+        ] = mac_address
+
+        return True
+
     def handle_ndp(
         self,
         pkt,
@@ -89,24 +130,65 @@ class DataPlane:
         if ipv6_pkt.src == "::":
             return None
 
+        source_ipv6 = ipaddress.IPv6Address(
+            ipv6_pkt.src
+        )
+
+        # LAN-side NDP:
+        # only a host from the configured LAN prefix may
+        # resolve the logical LAN gateway.
         if target == cfg.LAN_GATEWAY:
-            self.lan_port = in_port
+            if source_ipv6 not in self.lan_network:
+                return None
 
-            source_ipv6 = ipaddress.IPv6Address(
+            # Never learn the LAN side from the verified
+            # OSPF transit port.
+            if (
+                self.transit_port is not None
+                and in_port == self.transit_port
+            ):
+                return None
+
+            # The first valid LAN NS identifies the LAN port.
+            if self.lan_port is None:
+                self.lan_port = in_port
+
+            # Once learned, the LAN gateway answers only
+            # on that same port.
+            elif in_port != self.lan_port:
+                return None
+
+            self.lan_hosts[
                 ipv6_pkt.src
-            )
+            ] = eth_pkt.src
 
-            if source_ipv6 in self.lan_network:
-                self.lan_hosts[
-                    ipv6_pkt.src
-                ] = eth_pkt.src
-
+        # Transit-side NDP:
+        # fe80::10 belongs only to the point-to-point
+        # OSPF-facing interface.
         elif target == cfg.LINK_LOCAL:
-            self.transit_port = in_port
-            self.transit_neighbors[ipv6_pkt.src] = eth_pkt.src
+            if self.transit_port is None:
+                return None
 
-            self.transit_router_mac = eth_pkt.src
-            self.transit_router_ipv6 = ipv6_pkt.src
+            if in_port != self.transit_port:
+                return None
+
+            # The transit peer must already have been learned
+            # from a verified OSPF Hello.
+            if (
+                self.transit_router_ipv6 is None
+                or self.transit_router_mac is None
+            ):
+                return None
+
+            if ipv6_pkt.src != self.transit_router_ipv6:
+                return None
+
+            if eth_pkt.src != self.transit_router_mac:
+                return None
+
+            self.transit_neighbors[
+                ipv6_pkt.src
+            ] = eth_pkt.src
 
         return self.build_neighbor_advertisement(
             destination_mac=eth_pkt.src,
@@ -240,16 +322,14 @@ class DataPlane:
         ):
             return None
 
-        self.lan_port = in_port
-
-        source_ipv6 = ipaddress.IPv6Address(
-            ipv6_pkt.src
+        lan_host_valid = self.learn_lan_host(
+            in_port=in_port,
+            ipv6_address=ipv6_pkt.src,
+            mac_address=eth_pkt.src
         )
 
-        if source_ipv6 in self.lan_network:
-            self.lan_hosts[
-                ipv6_pkt.src
-            ] = eth_pkt.src
+        if not lan_host_valid:
+            return None
 
         return self.build_echo_reply(
             destination_mac=eth_pkt.src,
