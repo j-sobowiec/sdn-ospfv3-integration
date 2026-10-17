@@ -525,6 +525,44 @@ class OSPFv3Controller(app_manager.RyuApp):
             prefix_length
         )
 
+    def delete_ipv6_reverse_flow(
+        self,
+        host_ipv6,
+        transit_port
+    ):
+        if (
+            self.datapath is None
+            or transit_port is None
+        ):
+            return
+
+        datapath = self.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        match = parser.OFPMatch(
+            in_port=transit_port,
+            eth_type=ether_types.ETH_TYPE_IPV6,
+            ipv6_dst=host_ipv6
+        )
+
+        flow_mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE_STRICT,
+            table_id=0,
+            priority=100,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+            match=match
+        )
+
+        datapath.send_msg(flow_mod)
+
+        self.logger.info(
+            "[DATA][REVERSE FLOW DELETE] host=%s",
+            host_ipv6
+        )
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -629,6 +667,7 @@ class OSPFv3Controller(app_manager.RyuApp):
                     )
 
                     matching_route = None
+                    matching_prefix_length = -1
 
                     for route in self.get_ospf_transit_routes():
                         network = ipaddress.IPv6Network(
@@ -636,9 +675,13 @@ class OSPFv3Controller(app_manager.RyuApp):
                             strict=False
                         )
 
-                        if destination in network:
+                        if (
+                            destination in network
+                            and route["prefix_length"]
+                            > matching_prefix_length
+                        ):
                             matching_route = route
-                            break
+                            matching_prefix_length = route["prefix_length"]
 
                     if (
                         matching_route is not None
@@ -689,10 +732,25 @@ class OSPFv3Controller(app_manager.RyuApp):
                         return
                       
         if ipv6_pkt and ipv6_pkt.nxt == 89:
-        
-            ospf_offset = 14 + 40
+            try:
+                ipv6_index = pkt.protocols.index(
+                    ipv6_pkt
+                )
+                ospf_payload = pkt.protocols[
+                    ipv6_index + 1
+                ]
+            except (ValueError, IndexError):
+                return
 
-            ospf_data = msg.data[ospf_offset:]
+            if not isinstance(
+                ospf_payload,
+                (bytes, bytearray)
+            ):
+                return
+
+            ospf_data = bytes(
+                ospf_payload
+            )
 
             if len(ospf_data) >= 16:
                 (
@@ -735,6 +793,62 @@ class OSPFv3Controller(app_manager.RyuApp):
                     struct.pack("!I", area_id)
                 )
 
+                if area_id_text != cfg.AREA_ID:
+                    self.logger.warning(
+                        "[OSPF][DROP] area mismatch "
+                        "received=%s expected=%s",
+                        area_id_text,
+                        cfg.AREA_ID
+                    )
+                    return
+
+                if instance_id != cfg.INSTANCE_ID:
+                    self.logger.warning(
+                        "[OSPF][DROP] instance mismatch "
+                        "received=%d expected=%d",
+                        instance_id,
+                        cfg.INSTANCE_ID
+                    )
+                    return
+
+                try:
+                    ospf_source = ipaddress.IPv6Address(
+                        ipv6_pkt.src
+                    )
+                except ValueError:
+                    return
+
+                if not ospf_source.is_link_local:
+                    self.logger.warning(
+                        "[OSPF][DROP] non-link-local source=%s",
+                        ipv6_pkt.src
+                    )
+                    return
+
+                try:
+                    ospf_destination = ipaddress.IPv6Address(
+                        ipv6_pkt.dst
+                    )
+                except ValueError:
+                    return
+
+                ospf_multicast = (
+                    ipaddress.IPv6Address("ff02::5"),
+                    ipaddress.IPv6Address("ff02::6")
+                )
+
+                if (
+                    ospf_destination in ospf_multicast
+                    and ipv6_pkt.hop_limit != 1
+                ):
+                    self.logger.warning(
+                        "[OSPF][DROP] invalid multicast hop-limit "
+                        "dst=%s received=%d expected=1",
+                        ipv6_pkt.dst,
+                        ipv6_pkt.hop_limit
+                    )
+                    return
+                
                 if version == 3 and pkt_type == 1 and pkt_len >= 36:
 
                     self.handle_ospf_hello(
@@ -823,7 +937,26 @@ class OSPFv3Controller(app_manager.RyuApp):
         dead_interval = hello["dead_interval"]
         neighbors = hello["neighbors"]
 
+        if hello_interval != cfg.HELLO_INTERVAL:
+            self.logger.warning(
+                "[OSPF][HELLO DROP] hello interval mismatch "
+                "received=%ds expected=%ds",
+                hello_interval,
+                cfg.HELLO_INTERVAL
+            )
+            return
+
+        if dead_interval != cfg.DEAD_INTERVAL:
+            self.logger.warning(
+                "[OSPF][HELLO DROP] dead interval mismatch "
+                "received=%ds expected=%ds",
+                dead_interval,
+                cfg.DEAD_INTERVAL
+            )
+            return
+
         self.neighbor.mark_hello_received()
+
         self.neighbor.port = in_port
         self.neighbor.ipv6 = ipv6_pkt.src
         self.neighbor.mac = eth_pkt.src
@@ -899,7 +1032,21 @@ class OSPFv3Controller(app_manager.RyuApp):
             )
 
             self.send_ospfv3_hello()
-        
+
+    def is_current_ospf_neighbor(
+        self,
+        in_port,
+        ipv6_pkt,
+        router_id_text
+    ):
+        return (
+            self.neighbor.router_id is not None
+            and router_id_text == self.neighbor.router_id
+            and router_id_text in self.neighbor.router_ids
+            and ipv6_pkt.src == self.neighbor.ipv6
+            and in_port == self.neighbor.port
+        )
+    
     def handle_ospf_dbd(
         self,
         in_port,
@@ -913,6 +1060,20 @@ class OSPFv3Controller(app_manager.RyuApp):
         """
         Handles a received OSPFv3 Database Description packet.
         """
+
+        if not self.is_current_ospf_neighbor(
+            in_port,
+            ipv6_pkt,
+            router_id_text
+        ):
+            self.logger.warning(
+                "[OSPF][DROP] packet from unknown neighbor "
+                "router=%s src=%s port=%s",
+                router_id_text,
+                ipv6_pkt.src,
+                in_port
+            )
+            return
 
         try:
             dbd = parse_dbd(
@@ -933,6 +1094,18 @@ class OSPFv3Controller(app_manager.RyuApp):
         ms_bit = dbd["ms_bit"]
         dd_sequence = dbd["dd_sequence"]
         lsa_headers = dbd["lsa_headers"]
+
+        if (
+            interface_mtu == 0
+            or interface_mtu > cfg.INTERFACE_MTU
+        ):
+            self.logger.warning(
+                "[OSPF][DBD DROP] invalid MTU "
+                "received=%d local=%d",
+                interface_mtu,
+                cfg.INTERFACE_MTU
+            )
+            return
 
         self.log_dbd(
             in_port,
@@ -1077,6 +1250,19 @@ class OSPFv3Controller(app_manager.RyuApp):
         """
         Handles a received OSPFv3 Link State Request packet.
         """
+        if not self.is_current_ospf_neighbor(
+            in_port,
+            ipv6_pkt,
+            router_id_text
+        ):
+            self.logger.warning(
+                "[OSPF][DROP] packet from unknown neighbor "
+                "router=%s src=%s port=%s",
+                router_id_text,
+                ipv6_pkt.src,
+                in_port
+            )
+            return
 
         try:
             requests = parse_lsr(
@@ -1150,6 +1336,20 @@ class OSPFv3Controller(app_manager.RyuApp):
         """
         Handles a received OSPFv3 Link State Update packet.
         """
+
+        if not self.is_current_ospf_neighbor(
+            in_port,
+            ipv6_pkt,
+            router_id_text
+        ):
+            self.logger.warning(
+                "[OSPF][DROP] packet from unknown neighbor "
+                "router=%s src=%s port=%s",
+                router_id_text,
+                ipv6_pkt.src,
+                in_port
+            )
+            return
 
         try:
             lsu_lsa_headers = parse_lsu(
@@ -1273,6 +1473,20 @@ class OSPFv3Controller(app_manager.RyuApp):
         """
         Handles a received OSPFv3 Link State Acknowledgment packet.
         """
+
+        if not self.is_current_ospf_neighbor(
+            in_port,
+            ipv6_pkt,
+            router_id_text
+        ):
+            self.logger.warning(
+                "[OSPF][DROP] packet from unknown neighbor "
+                "router=%s src=%s port=%s",
+                router_id_text,
+                ipv6_pkt.src,
+                in_port
+            )
+            return
 
         try:
             lsa_headers = parse_lsack(
@@ -1451,6 +1665,18 @@ class OSPFv3Controller(app_manager.RyuApp):
                 # This also removes stale route-derived
                 # OpenFlow entries.
                 self.recompute_routing_state()
+
+                dead_transit_port = (
+                    self.data_plane.transit_port
+                )
+
+                for host_ipv6 in list(
+                    self.data_plane.lan_hosts
+                ):
+                    self.delete_ipv6_reverse_flow(
+                        host_ipv6,
+                        dead_transit_port
+                    )
 
                 # The OSPF next-hop is no longer valid.
                 self.data_plane.reset_transit()
