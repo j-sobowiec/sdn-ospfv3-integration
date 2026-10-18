@@ -3,6 +3,14 @@ import socket
 import struct
 import time
 
+from scapy.contrib.ospf import (
+    OSPFv3_Intra_Area_Prefix_LSA,
+    OSPFv3_Link,
+    OSPFv3_Link_LSA,
+    OSPFv3_Prefix_Item,
+    OSPFv3_Router_LSA,
+)
+
 from ospfv3 import config as cfg
 from ospfv3.lsa import (
     finalize_ospfv3_lsa_checksum,
@@ -207,167 +215,90 @@ class LocalLSA:
             )
             return None
 
-        advertising_router = struct.unpack(
-            "!I",
-            socket.inet_aton(cfg.ROUTER_ID)
-        )[0]
-
-        neighbor_router = struct.unpack(
-            "!I",
-            socket.inet_aton(neighbor_router_id)
-        )[0]
-
-        body = (
-            struct.pack("!B", 0)
-            + cfg.OPTIONS.to_bytes(3, byteorder="big")
-            + struct.pack(
-                "!BBHIII",
-                1,
-                0,
-                cfg.INTERFACE_COST,
-                cfg.INTERFACE_ID,
-                neighbor_interface_id,
-                neighbor_router
-            )
+        lsa = OSPFv3_Router_LSA(
+            age=0,
+            type=0x2001,
+            id="0.0.0.0",
+            adrouter=cfg.ROUTER_ID,
+            seq=self.router_sequence,
+            chksum=0,
+            flags=0,
+            options=cfg.OPTIONS,
+            linklist=[
+                OSPFv3_Link(
+                    type=1,
+                    reserved=0,
+                    metric=cfg.INTERFACE_COST,
+                    intid=cfg.INTERFACE_ID,
+                    neighintid=neighbor_interface_id,
+                    neighbor=neighbor_router_id,
+                )
+            ],
         )
 
-        length = 20 + len(body)
-
-        header = struct.pack(
-            "!HHIIIHH",
-            0,
-            0x2001,
-            0,
-            advertising_router,
-            self.router_sequence,
-            0,
-            length
-        )
-
-        return finalize_ospfv3_lsa_checksum(
-            header + body
-        )
+        return finalize_ospfv3_lsa_checksum(bytes(lsa))
 
     def build_prefix(self):
-        advertising_router = struct.unpack(
-            "!I",
-            socket.inet_aton(cfg.ROUTER_ID)
-        )[0]
-
         network = ipaddress.IPv6Network(
             f"{cfg.LAN_PREFIX}/{cfg.LAN_PREFIX_LEN}",
-            strict=False
+            strict=False,
         )
 
-        prefix_length = (
-            cfg.LAN_PREFIX_LEN + 7
-        ) // 8
-
-        prefix = network.network_address.packed[
-            :prefix_length
-        ]
-
-        prefix += b"\x00" * (
-            (-len(prefix)) % 4
+        lsa = OSPFv3_Intra_Area_Prefix_LSA(
+            age=0,
+            type=0x2009,
+            id="0.0.0.0",
+            adrouter=cfg.ROUTER_ID,
+            seq=self.prefix_sequence,
+            chksum=0,
+            prefixes=1,
+            reflstype=0x2001,
+            reflsid="0.0.0.0",
+            refadrouter=cfg.ROUTER_ID,
+            prefixlist=[
+                OSPFv3_Prefix_Item(
+                    prefixlen=cfg.LAN_PREFIX_LEN,
+                    prefixoptions=0,
+                    metric=cfg.LAN_PREFIX_METRIC,
+                    prefix=f"{network.network_address}/{cfg.LAN_PREFIX_LEN}",
+                )
+            ],
         )
 
-        prefix_entry = struct.pack(
-            "!BBH",
-            cfg.LAN_PREFIX_LEN,
-            0,
-            cfg.LAN_PREFIX_METRIC
-        ) + prefix
-
-        body = struct.pack(
-            "!HHII",
-            1,
-            0x2001,
-            0,
-            advertising_router
-        ) + prefix_entry
-
-        length = 20 + len(body)
-
-        header = struct.pack(
-            "!HHIIIHH",
-            0,
-            0x2009,
-            0,
-            advertising_router,
-            self.prefix_sequence,
-            0,
-            length
-        )
-
-        return finalize_ospfv3_lsa_checksum(
-            header + body
-        )
+        return finalize_ospfv3_lsa_checksum(bytes(lsa))
 
     def build_link(self):
-        advertising_router = struct.unpack(
-            "!I",
-            socket.inet_aton(cfg.ROUTER_ID)
-        )[0]
-
-        link_local = socket.inet_pton(
-            socket.AF_INET6,
-            cfg.LINK_LOCAL
-        )
-
         network = ipaddress.IPv6Network(
             f"{cfg.TRANSIT_PREFIX}/{cfg.TRANSIT_PREFIX_LEN}",
-            strict=False
+            strict=False,
         )
 
-        prefix_length = (
-            cfg.TRANSIT_PREFIX_LEN + 7
-        ) // 8
-
-        prefix = network.network_address.packed[
-            :prefix_length
-        ]
-
-        prefix += b"\x00" * (
-            (-len(prefix)) % 4
+        interface_lsid = socket.inet_ntoa(
+            struct.pack("!I", cfg.INTERFACE_ID)
         )
 
-        prefix_entry = struct.pack(
-            "!BBH",
-            cfg.TRANSIT_PREFIX_LEN,
-            0,
-            0
-        ) + prefix
-
-        body = (
-            struct.pack(
-                "!B",
-                cfg.ROUTER_PRIORITY
-            )
-            + cfg.OPTIONS.to_bytes(
-                3,
-                byteorder="big"
-            )
-            + link_local
-            + struct.pack("!I", 1)
-            + prefix_entry
+        lsa = OSPFv3_Link_LSA(
+            age=0,
+            type=0x0008,
+            id=interface_lsid,
+            adrouter=cfg.ROUTER_ID,
+            seq=self.link_sequence,
+            chksum=0,
+            prio=cfg.ROUTER_PRIORITY,
+            options=cfg.OPTIONS,
+            lladdr=cfg.LINK_LOCAL,
+            prefixes=1,
+            prefixlist=[
+                OSPFv3_Prefix_Item(
+                    prefixlen=cfg.TRANSIT_PREFIX_LEN,
+                    prefixoptions=0,
+                    metric=0,
+                    prefix=f"{network.network_address}/{cfg.TRANSIT_PREFIX_LEN}",
+                )
+            ],
         )
 
-        length = 20 + len(body)
-
-        header = struct.pack(
-            "!HHIIIHH",
-            0,
-            0x0008,
-            cfg.INTERFACE_ID,
-            advertising_router,
-            self.link_sequence,
-            0,
-            length
-        )
-
-        return finalize_ospfv3_lsa_checksum(
-            header + body
-        )
+        return finalize_ospfv3_lsa_checksum(bytes(lsa))
 
     def install(self, raw_lsa):
         if len(raw_lsa) < 20:

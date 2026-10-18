@@ -1,6 +1,12 @@
 import socket
 import struct
 
+from scapy.contrib.ospf import (
+    OSPFv3_Intra_Area_Prefix_LSA,
+    OSPFv3_Link_LSA,
+    OSPFv3_Router_LSA,
+)
+
 from ospfv3 import config as cfg
 
 
@@ -37,307 +43,166 @@ def ospfv3_lsa_type_description(ls_type):
 
     return f"{name}, {scope}"
 
-def parse_ospfv3_router_lsa(raw_lsa):
-    """
-    Parsuje pelne OSPFv3 Router-LSA (LS Type 0x2001).
 
-    raw_lsa zawiera:
-      20 B - wspolny naglowek LSA
-       4 B - Flags + Options
-      Nx16 B - opisy linkow
-    """
+def _check_lsa_header(raw_lsa, expected_type, min_length, name):
+    if len(raw_lsa) < min_length:
+        raise ValueError(f"{name} is too short: {len(raw_lsa)} B")
 
-    if len(raw_lsa) < 24:
+    lsa_type = int.from_bytes(raw_lsa[2:4], "big")
+    if lsa_type != expected_type:
+        raise ValueError(f"{name}: unexpected LS Type=0x{lsa_type:04x}")
+
+    declared_length = int.from_bytes(raw_lsa[18:20], "big")
+    if declared_length != len(raw_lsa):
         raise ValueError(
-            f"Router-LSA is too short: {len(raw_lsa)} B"
-        )
-
-    # Pole Length znajduje sie w ostatnich 2 bajtach
-    # wspolnego 20-bajtowego naglowka LSA.
-    ls_length = struct.unpack(
-        "!H",
-        raw_lsa[18:20]
-    )[0]
-
-    if ls_length != len(raw_lsa):
-        raise ValueError(
-            f"Router-LSA: LS Length={ls_length}, "
+            f"{name}: LS Length={declared_length}, "
             f"actual length={len(raw_lsa)}"
         )
 
-    # Pierwszy bajt body = flagi routera.
-    flags = raw_lsa[20]
 
-    # Kolejne 3 bajty = Options.
-    options = int.from_bytes(
-        raw_lsa[21:24],
-        byteorder="big"
+def _check_prefixes(raw_lsa, count, start, name):
+    """Validate on-wire entry boundaries before Scapy decodes the list."""
+    remaining = len(raw_lsa) - start
+    if count > remaining // 4:
+        raise ValueError(f"{name}: prefix count exceeds available data")
+
+    offset = start
+    for index in range(count):
+        if offset + 4 > len(raw_lsa):
+            raise ValueError(f"{name}: insufficient data for prefix #{index + 1}")
+
+        prefix_length = raw_lsa[offset]
+        if prefix_length > 128:
+            raise ValueError(f"{name}: invalid prefix length {prefix_length}")
+
+        address_length = ((prefix_length + 31) // 32) * 4
+        offset += 4 + address_length
+        if offset > len(raw_lsa):
+            raise ValueError(f"{name}: prefix #{index + 1} exceeds LSA boundary")
+
+    if offset != len(raw_lsa):
+        raise ValueError(f"{name}: trailing bytes after prefix list")
+
+
+def _decode_lsa(lsa_class, raw_lsa, name):
+    try:
+        return lsa_class(bytes(raw_lsa))
+    except Exception as exc:
+        raise ValueError(f"{name}: Scapy decode error: {exc}") from exc
+
+
+def _interface_id_text(value):
+    return socket.inet_ntoa(struct.pack("!I", value))
+
+
+def _ipv6_prefix_address(value):
+    # Scapy's IP6PrefixField can expose a CIDR string or (address, length).
+    if isinstance(value, tuple):
+        value = value[0]
+    address = str(value).split("/", 1)[0]
+    return socket.inet_ntop(
+        socket.AF_INET6, socket.inet_pton(socket.AF_INET6, address)
     )
 
-    link_data_length = ls_length - 24
 
-    # Kazdy opis linku Router-LSA ma dokladnie 16 B.
-    if link_data_length % 16 != 0:
+def parse_ospfv3_router_lsa(raw_lsa):
+    name = "Router-LSA"
+    _check_lsa_header(raw_lsa, 0x2001, 24, name)
+
+    link_length = len(raw_lsa) - 24
+    if link_length % 16:
         raise ValueError(
-            "Router-LSA: link description section "
-            f"has invalid length {link_data_length} B"
+            f"{name}: link description section has invalid length {link_length} B"
         )
 
-    links = []
+    lsa = _decode_lsa(OSPFv3_Router_LSA, raw_lsa, name)
+    if len(lsa.linklist) != link_length // 16:
+        raise ValueError(f"{name}: inconsistent link descriptions")
 
-    offset = 24
+    link_type_names = {
+        1: "Point-to-Point",
+        2: "Transit Network",
+        3: "Reserved",
+        4: "Virtual Link",
+    }
 
-    while offset < ls_length:
-        (
-            link_type,
-            reserved,
-            metric,
-            interface_id,
-            neighbor_interface_id,
-            neighbor_router_id
-        ) = struct.unpack(
-            "!BBHIII",
-            raw_lsa[offset:offset + 16]
-        )
-
-        link_type_names = {
-            1: "Point-to-Point",
-            2: "Transit Network",
-            3: "Reserved",
-            4: "Virtual Link",
+    links = [
+        {
+            "type": int(link.type),
+            "type_name": link_type_names.get(int(link.type), "Unknown"),
+            "reserved": int(link.reserved),
+            "metric": int(link.metric),
+            "interface_id": _interface_id_text(link.intid),
+            "neighbor_interface_id": _interface_id_text(link.neighintid),
+            "neighbor_router_id": link.neighbor,
         }
-
-        links.append({
-            "type": link_type,
-            "type_name": link_type_names.get(
-                link_type,
-                "Unknown"
-            ),
-            "reserved": reserved,
-            "metric": metric,
-
-            "interface_id": socket.inet_ntoa(
-                struct.pack("!I", interface_id)
-            ),
-
-            "neighbor_interface_id": socket.inet_ntoa(
-                struct.pack("!I", neighbor_interface_id)
-            ),
-
-            "neighbor_router_id": socket.inet_ntoa(
-                struct.pack("!I", neighbor_router_id)
-            ),
-        })
-
-        offset += 16
+        for link in lsa.linklist
+    ]
 
     return {
-        "flags": flags,
-        "options": options,
+        "flags": int(lsa.flags),
+        "options": int(lsa.options),
         "links": links,
     }
 
+
 def parse_ospfv3_link_lsa(raw_lsa):
-    if len(raw_lsa) < 44:
-        raise ValueError(
-            f"Link-LSA is too short: {len(raw_lsa)} B"
-        )
+    name = "Link-LSA"
+    _check_lsa_header(raw_lsa, 0x0008, 44, name)
 
-    router_priority = raw_lsa[20]
+    prefix_count = int.from_bytes(raw_lsa[40:44], "big")
+    _check_prefixes(raw_lsa, prefix_count, 44, name)
 
-    options = int.from_bytes(
-        raw_lsa[21:24],
-        byteorder="big"
-    )
+    lsa = _decode_lsa(OSPFv3_Link_LSA, raw_lsa, name)
+    if len(lsa.prefixlist) != prefix_count:
+        raise ValueError(f"{name}: inconsistent prefix count")
 
-    link_local_address = socket.inet_ntop(
-        socket.AF_INET6,
-        raw_lsa[24:40]
-    )
-
-    number_of_prefixes = struct.unpack(
-        "!I",
-        raw_lsa[40:44]
-    )[0]
-
-    prefixes = []
-
-    # Prefiksy zaczynaja sie po:
-    # 20 B LSA header
-    # 24 B stalej czesci Link-LSA
-    offset = 44
-
-    for index in range(number_of_prefixes):
-
-        # Kazdy wpis prefiksu ma najpierw 4 B:
-        # PrefixLength + PrefixOptions + Reserved
-        if offset + 4 > len(raw_lsa):
-            raise ValueError(
-                f"Link-LSA: insufficient data for prefix #{index + 1}"
-            )
-
-        prefix_length = raw_lsa[offset]
-        prefix_options = raw_lsa[offset + 1]
-
-        reserved = struct.unpack(
-            "!H",
-            raw_lsa[offset + 2:offset + 4]
-        )[0]
-
-        if prefix_length > 128:
-            raise ValueError(
-                f"Link-LSA: invalid prefix length: {prefix_length}"
-            )
-
-        # Adres prefiksu jest zapisany w wielokrotnosci 32 bitow.
-        prefix_bytes_length = (
-            (prefix_length + 31) // 32
-        ) * 4
-
-        prefix_start = offset + 4
-        prefix_end = prefix_start + prefix_bytes_length
-
-        if prefix_end > len(raw_lsa):
-            raise ValueError(
-                f"Link-LSA: prefix #{index + 1} exceeds LSA boundary"
-            )
-
-        prefix_bytes = bytes(
-            raw_lsa[prefix_start:prefix_end]
-        )
-
-        # Uzupelniamy zerami do pelnego adresu IPv6.
-        full_ipv6 = prefix_bytes.ljust(16, b"\x00")
-
-        prefix_address = socket.inet_ntop(
-            socket.AF_INET6,
-            full_ipv6
-        )
-
-        prefixes.append({
-            "prefix_length": prefix_length,
-            "prefix_options": prefix_options,
-            "reserved": reserved,
-            "prefix": prefix_address,
-        })
-
-        offset = prefix_end
+    prefixes = [
+        {
+            "prefix_length": int(item.prefixlen),
+            "prefix_options": int(item.prefixoptions),
+            # Scapy reuses the Prefix Item's metric field for this reserved word.
+            "reserved": int(item.metric),
+            "prefix": _ipv6_prefix_address(item.prefix),
+        }
+        for item in lsa.prefixlist
+    ]
 
     return {
-        "router_priority": router_priority,
-        "options": options,
-        "link_local_address": link_local_address,
-        "number_of_prefixes": number_of_prefixes,
+        "router_priority": int(lsa.prio),
+        "options": int(lsa.options),
+        "link_local_address": lsa.lladdr,
+        "number_of_prefixes": int(lsa.prefixes),
         "prefixes": prefixes,
     }
 
+
 def parse_ospfv3_intra_area_prefix_lsa(raw_lsa):
-    if len(raw_lsa) < 32:
-        raise ValueError(
-            f"Intra-Area-Prefix-LSA is too short: {len(raw_lsa)} B"
-        )
+    name = "Intra-Area-Prefix-LSA"
+    _check_lsa_header(raw_lsa, 0x2009, 32, name)
 
-    # Stala czesc body zaczyna sie po 20-bajtowym LSA header.
-    number_of_prefixes, referenced_ls_type = struct.unpack(
-        "!HH",
-        raw_lsa[20:24]
-    )
+    prefix_count = int.from_bytes(raw_lsa[20:22], "big")
+    _check_prefixes(raw_lsa, prefix_count, 32, name)
 
-    referenced_link_state_id = struct.unpack(
-        "!I",
-        raw_lsa[24:28]
-    )[0]
+    lsa = _decode_lsa(OSPFv3_Intra_Area_Prefix_LSA, raw_lsa, name)
+    if len(lsa.prefixlist) != prefix_count:
+        raise ValueError(f"{name}: inconsistent prefix count")
 
-    referenced_advertising_router = struct.unpack(
-        "!I",
-        raw_lsa[28:32]
-    )[0]
-
-    prefixes = []
-
-    # 20 B LSA header
-    # 12 B stalej czesci Intra-Area-Prefix-LSA
-    offset = 32
-
-    for index in range(number_of_prefixes):
-
-        # PrefixLength + PrefixOptions + Metric = 4 B
-        if offset + 4 > len(raw_lsa):
-            raise ValueError(
-                f"Intra-Area-Prefix-LSA: "
-                f"insufficient data for prefix #{index + 1}"
-            )
-
-        prefix_length = raw_lsa[offset]
-        prefix_options = raw_lsa[offset + 1]
-
-        metric = struct.unpack(
-            "!H",
-            raw_lsa[offset + 2:offset + 4]
-        )[0]
-
-        if prefix_length > 128:
-            raise ValueError(
-                f"Intra-Area-Prefix-LSA: "
-                f"invalid prefix length {prefix_length}"
-            )
-
-        # Prefix jest kodowany w wielokrotnosci 32 bitow.
-        prefix_bytes_length = (
-            (prefix_length + 31) // 32
-        ) * 4
-
-        prefix_start = offset + 4
-        prefix_end = prefix_start + prefix_bytes_length
-
-        if prefix_end > len(raw_lsa):
-            raise ValueError(
-                f"Intra-Area-Prefix-LSA: "
-                f"prefix #{index + 1} exceeds LSA boundary"
-            )
-
-        prefix_bytes = bytes(
-            raw_lsa[prefix_start:prefix_end]
-        )
-
-        full_ipv6 = prefix_bytes.ljust(
-            16,
-            b"\x00"
-        )
-
-        prefix_address = socket.inet_ntop(
-            socket.AF_INET6,
-            full_ipv6
-        )
-
-        prefixes.append({
-            "prefix": prefix_address,
-            "prefix_length": prefix_length,
-            "prefix_options": prefix_options,
-            "metric": metric,
-        })
-
-        offset = prefix_end
+    prefixes = [
+        {
+            "prefix": _ipv6_prefix_address(item.prefix),
+            "prefix_length": int(item.prefixlen),
+            "prefix_options": int(item.prefixoptions),
+            "metric": int(item.metric),
+        }
+        for item in lsa.prefixlist
+    ]
 
     return {
-        "number_of_prefixes": number_of_prefixes,
-
-        "referenced_ls_type": referenced_ls_type,
-
-        "referenced_link_state_id": socket.inet_ntoa(
-            struct.pack(
-                "!I",
-                referenced_link_state_id
-            )
-        ),
-
-        "referenced_advertising_router": socket.inet_ntoa(
-            struct.pack(
-                "!I",
-                referenced_advertising_router
-            )
-        ),
-
+        "number_of_prefixes": int(lsa.prefixes),
+        "referenced_ls_type": int(lsa.reflstype),
+        "referenced_link_state_id": lsa.reflsid,
+        "referenced_advertising_router": lsa.refadrouter,
         "prefixes": prefixes,
     }
 

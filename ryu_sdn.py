@@ -12,6 +12,10 @@ from ryu.lib.packet import ether_types
 from ryu.lib import hub
 import time
 import ipaddress
+
+from scapy.contrib.ospf import OSPFv3_Hdr
+from scapy.error import Scapy_Exception
+
 from dataplane import DataPlane
 
 from ospfv3 import config as cfg
@@ -753,16 +757,24 @@ class OSPFv3Controller(app_manager.RyuApp):
             )
 
             if len(ospf_data) >= 16:
-                (
-                    version,
-                    pkt_type,
-                    pkt_len,
-                    router_id,
-                    area_id,
-                    checksum,
-                    instance_id,
-                    reserved
-                ) = struct.unpack("!BBHIIHBB", ospf_data[:16])
+                # Scapy decodes only the fixed 16-byte OSPFv3 header.
+                # Keep the packet-length and IPv6 pseudo-header checksum
+                # validation below unchanged.
+                try:
+                    ospf_header = OSPFv3_Hdr(ospf_data[:16])
+                    version = int(ospf_header.version)
+                    pkt_type = int(ospf_header.type)
+                    pkt_len = int(ospf_header.len)
+                    router_id_text = ospf_header.src
+                    area_id_text = ospf_header.area
+                    router_id = int(ipaddress.IPv4Address(router_id_text))
+                    checksum = int(ospf_header.chksum)
+                    instance_id = int(ospf_header.instance)
+                except (Scapy_Exception, ValueError, TypeError, IndexError) as exc:
+                    self.logger.warning(
+                        "[OSPF][DROP] invalid OSPFv3 header: %s", exc
+                    )
+                    return
 
                 if pkt_len < 16 or pkt_len > len(ospf_data):
                     return
@@ -784,14 +796,6 @@ class OSPFv3Controller(app_manager.RyuApp):
                         calculated_checksum
                     )
                     return
-
-                router_id_text = socket.inet_ntoa(
-                    struct.pack("!I", router_id)
-                )
-
-                area_id_text = socket.inet_ntoa(
-                    struct.pack("!I", area_id)
-                )
 
                 if area_id_text != cfg.AREA_ID:
                     self.logger.warning(
